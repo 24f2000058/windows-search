@@ -1,5 +1,8 @@
 //! Flint launcher — direct Win32 UI spike.
 
+// Off Windows only the model (and its tests) are built.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 mod model;
 #[cfg(windows)]
 mod win;
