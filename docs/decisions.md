@@ -129,12 +129,23 @@ would have outranked the genuine scattered match.
 Measured (~991k links): write 4.0 s, 55 MB on disk, cold load 2.1 s, 10k
 changes in 0.58 s.
 
-**Open:** a 2 s cold load means search is partial during startup. The UI
-must say "loading index" (never "no matches"). Options:
+**Startup (phase 2).** Profiling showed the 2 s cold load is mostly index
+rebuild (1.7 s), not SQLite (0.7 s). So snapshots store the name-table
+*columns* per volume, not records.
 
-* an mmap-able snapshot of the name table, written at idle and validated
-  against the SQLite checkpoint (recommended)
-* lazy per-volume loading
+* A snapshot is used only if its `commit_seq` equals the store's (schema v2
+  adds a per-volume commit counter). It is FNV-checksummed, and every name
+  span is bounds- and UTF-8-checked on import.
+* Stale, corrupt or foreign snapshots fall back to SQLite.
+* Snapshots are never written after a failed sync (memory may be ahead of
+  the store).
+
+Measured at ~1M entries: 0.62–0.74 s vs 1.93–2.41 s, including 0.19 s of
+SQLite `quick_check`. Loading happens in the volume workers; the UI shows
+"no matches yet — index still loading" instead of "no matches".
+
+**Remaining options:** defer `quick_check` to the background; mmap the
+snapshot.
 
 ## ADR-005 Elevation model — Open (recommendation)
 
@@ -160,12 +171,17 @@ needed** on whether 2 is in scope for v1.
 
 ## ADR-006 NTFS metadata, hard links and ReFS — Provisional
 
-* `FSCTL_ENUM_USN_DATA` supplies names, parents and attributes, but not
-  size/mtime. Entries are marked `META_STALE` and refreshed by a bounded
-  background loop (`refresh_stale_meta`). Size/date filters must say that
-  results are partial until it finishes. A raw `$MFT` reader (sequential,
-  gives all `$FILE_NAME`s, sizes and times) is planned to replace this for
-  the initial scan.
+* **Phase 2:** the initial scan reads the raw `$MFT` sequentially in 4 MB
+  chunks. The parser applies update-sequence fixups and emits every
+  non-DOS `$FILE_NAME` (all hard links), the `$STANDARD_INFORMATION` mtime
+  and the unnamed `$DATA` size, and it merges extension records by base
+  reference.
+* If the MFT cannot be read, or any record is rejected (torn by a
+  concurrent write, or corrupt), `FSCTL_ENUM_USN_DATA` also runs; applying
+  both is idempotent. Changes during the read are replayed from the journal
+  as before.
+* `ENUM_USN_DATA`-only entries keep `META_STALE` and are refreshed by the
+  catalog's bounded background loop.
 * **Unverified on hardware:**
   * whether enumeration yields one record per hard link
   * the exact reason flags for removing a non-last link
@@ -221,6 +237,46 @@ Limits for all of them: time, memory (Job Object), input size, archive
 depth/ratio and cache size. Requests carry the selection generation, and
 stale results are dropped. With the viewer off, no backend is loaded or
 scheduled.
+
+## ADR-010 Configuration: versioned TOML — Accepted
+
+The config is hand-editable TOML in the data directory, stamped with
+`version`.
+
+* Loading never fails. A missing file is created. A malformed file is moved
+  to `config.toml.broken` and replaced with defaults. An invalid section or
+  value is reset individually, so one typo does not discard all settings.
+* A file from a newer version is used leniently and never overwritten.
+* Migrations are ordered functions over the TOML tree, with a `.vN.bak`
+  backup. Saves are atomic (temp file + rename, previous copy as `.bak`).
+* Every event is a `Note` surfaced in the UI status line.
+* Data directory: `%LOCALAPPDATA%\Flint\` (machine-specific index, not
+  roamed), or `<exe dir>\data\` when `portable.marker` is next to the exe.
+  Uninstall removes that one directory.
+
+## ADR-011 Result icons by file type only — Accepted
+
+Icons come from `SHGetFileInfoW(..., SHGFI_USEFILEATTRIBUTES)`, cached per
+extension. Resolving per-file icons would load third-party icon-handler
+shell extensions against the user's actual files. That is slower, and it
+conflicts with "never execute files to preview them". Cost: an `.exe` shows
+the generic application icon.
+
+## ADR-012 Journal-less volumes: watch and reconcile — Accepted
+
+* A watched traversal starts `ReadDirectoryChangesW` (recursive) *before*
+  the initial walk.
+* Changed directories are reconciled incrementally: re-list, diff against
+  the index, walk only directories that are new, and commit atomically.
+  Filesystem I/O happens outside the table lock.
+* A buffer overflow forces a full re-walk. Watch failure falls back to
+  periodic re-walks with backoff.
+* Without a journal there is nothing to replay, so these volumes are
+  re-walked at every start (snapshot makes them searchable meanwhile).
+* Volume mode (journal vs traversal) is fixed at discovery time, and the
+  two modes use distinct store keys, because their root identities differ.
+* Excluded paths are honoured by walks and reconciliation. **Gap:**
+  journal volumes still index excluded paths (open item).
 
 ## Open decisions needing the owner
 

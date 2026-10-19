@@ -15,20 +15,30 @@ These need Windows hardware:
 - [ ] Windows CI (MSVC build + tests); compile-only checks run here today.
 - [ ] Owner decisions: ADR-005 scope, reference PC, name/license.
 
-## Phase 2: launcher and indexing
+## Phase 2: launcher and indexing — done (pending hardware validation)
 
-1. Multi-volume orchestrator:
-   * volume arrival/removal (`WM_DEVICECHANGE`)
-   * per-volume threads
-   * journal wait (`BytesToWaitFor`)
-   * background metadata refresh
-2. Raw `$MFT` reader for the initial scan (names of all links, sizes, times).
-3. Non-NTFS live updates with `ReadDirectoryChangesW` plus reconciliation.
-4. Startup snapshot (ADR-004 open item); "loading index" state in the UI.
-5. Config file (versioned, migrations, malformed-file recovery), portable
-   mode, settings UI, and real hotkey customization.
-6. Icons via an async `SHGetFileInfo`/`IShellItemImageFactory` cache.
-   Theming (light/dark/high contrast). UIA audit.
+Done (see requirements.md for evidence):
+
+- [x] Multi-volume catalog: per-volume workers, backoff, background
+  metadata refresh, removal/re-arrival, aggregated coverage.
+- [x] Volume discovery by drive type and settings; `WM_DEVICECHANGE`.
+- [x] Raw `$MFT` reader with `ENUM_USN_DATA` fallback.
+- [x] Non-NTFS live updates: `ReadDirectoryChangesW` + incremental
+  reconciliation.
+- [x] Startup snapshots (~3× faster cold load); "loading index" state.
+- [x] Versioned config with migrations/recovery; portable mode; hotkey,
+  search, theme and web provider from config.
+- [x] File-type icons; light/dark/high-contrast palettes (WCAG AA tested).
+
+Remaining from phase 2:
+
+- [ ] Settings window (config is file-only today).
+- [ ] UIA/accessibility audit and comctl32 v6 manifest.
+- [ ] Excluded paths for journal (NTFS) volumes.
+- [ ] Journal wait via `BytesToWaitFor` instead of 1 s polling. This needs
+  idle-CPU measurement on Windows first.
+- [ ] Hardware validation of everything marked Prototype (`ntfs_probe`,
+  Windows CI).
 
 ## Phase 3: search UX and file operations
 

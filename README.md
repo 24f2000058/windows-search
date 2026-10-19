@@ -4,11 +4,16 @@ Flint (working name) is a keyboard-driven Windows launcher. It does indexed
 filesystem search with aggressive, progressive fuzzy matching, and keeps all
 processing local.
 
-**State: phase 1 of 5.** The search engine, index model, persistence and
-recovery are implemented and tested. The NTFS adapter and Win32 UI are
-working prototypes that are compile-checked and smoke-tested under Wine, but
-**not yet validated on Windows hardware**. Viewer, file operations, content
-search, plugins and packaging are designed or not started. The full status
+**State: phase 2 of 5.**
+
+* **Implemented and tested on Linux:** the search engine, index
+  persistence/recovery, multi-volume catalog, startup snapshots, config,
+  and journal-less live updates.
+* **Prototypes, not yet validated on Windows hardware:** the Windows
+  adapters (raw `$MFT` reader, USN journal, `ReadDirectoryChangesW`) and the
+  launcher UI. They are compile-checked and run end to end under Wine.
+* **Designed or not started:** viewer, file operations, content search,
+  plugins and packaging. The full status
 per requirement is in [docs/requirements.md](docs/requirements.md).
 
 ## Layout
@@ -18,6 +23,7 @@ crates/flint-fuzzy      search engine: folding, bit-parallel kernels, name table
 crates/flint-index      journal model, per-volume state machine, SQLite store, traversal fallback, NTFS simulator
 crates/flint-ntfs       USN V2/V3 parser (fuzzed) + Win32 MFT/USN JournalSource + ntfs_probe example
 crates/flint-commands   command registry, /s web search, safe calculator
+crates/flint-config     versioned settings (TOML), migrations/recovery, data paths, hotkey parsing
 crates/flint-ui-win32   direct-Win32 UI spike (virtual ListView, highlights, timing)
 crates/flint-bench      reproducible benchmarks and synthetic corpus
 bench/cpp               C++ port of the hot kernels (Rust vs C++ comparison)
@@ -28,7 +34,7 @@ docs/                   architecture, decisions (ADRs), requirements, benchmarks
 ## Build and test
 
 ```sh
-cargo test --release                       # 82 tests (Linux or Windows)
+cargo test --release                       # 116 tests (Linux or Windows)
 cargo build --release -p flint-bench
 ./target/release/flint-bench engine --n 1000000
 
@@ -43,11 +49,19 @@ cargo build --release --target x86_64-pc-windows-gnu -p flint-ntfs --example ntf
 * `ntfs_probe.exe` lists volumes. `ntfs_probe.exe C:` (elevated) enumerates
   the MFT and reads the journal, printing timings and the behaviours still
   unverified on real hardware.
-* `flint-ui-win32.exe [folder]` indexes the folder (default: your profile)
-  by traversal. `flint-ui-win32.exe --synthetic 1000000` uses a synthetic
-  index instead. Press **Ctrl+Space**: arrows move, Enter reveals in
-  Explorer, Esc hides, Alt+F4 quits. Latencies are printed to the console.
-  `--selftest "q1|q2"` types the queries automatically.
+* `flint-ui-win32.exe` indexes all volumes by settings. NTFS volumes use
+  the change journal if the process can open it (elevated); otherwise they
+  use traversal plus change notifications. Options:
+  * `--root <folder>` indexes just one folder.
+  * `--synthetic 1000000` uses an in-memory benchmark corpus.
+  * `--selftest "q1|q2"` types the queries automatically.
+
+  Press **Ctrl+Space** (configurable): arrows move, Enter reveals in
+  Explorer, Esc hides, Alt+F4 quits. Latencies and volume status are
+  printed to the console.
+* **Settings:** `%LOCALAPPDATA%\Flint\config.toml`, created on first run.
+  For a portable copy, put an empty `portable.marker` next to the exe; all
+  data then lives in `data\` beside it.
 
 ## Query syntax
 

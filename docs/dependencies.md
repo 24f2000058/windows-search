@@ -9,28 +9,52 @@ that are not explicitly approved. Bundled native code: SQLite (public domain) vi
 |---|---|---|
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |
 | cc | 1.9.0 | MIT OR Apache-2.0 |
+| cfg-if | 1.0.5 | MIT OR Apache-2.0 |
 | crossbeam-deque | 0.8.8 | MIT OR Apache-2.0 |
 | crossbeam-epoch | 0.9.21 | MIT OR Apache-2.0 |
 | crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 |
 | either | 1.19.0 | MIT OR Apache-2.0 |
+| equivalent | 1.0.3 | Apache-2.0 OR MIT |
+| errno | 0.3.14 | MIT OR Apache-2.0 |
 | fallible-iterator | 0.3.0 | MIT/Apache-2.0 |
 | fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 |
+| fastrand | 2.5.0 | Apache-2.0 OR MIT |
 | find-msvc-tools | 0.1.15 | MIT OR Apache-2.0 |
 | foldhash | 0.2.0 | Zlib |
+| getrandom | 0.4.3 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | hashlink | 0.12.2 | MIT OR Apache-2.0 |
+| indexmap | 2.14.2 | Apache-2.0 OR MIT |
+| libc | 0.2.191 | MIT OR Apache-2.0 |
 | libsqlite3-sys | 0.38.2 | MIT |
+| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | memchr | 2.8.3 | Unlicense OR MIT |
+| once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | pkg-config | 0.3.34 | MIT OR Apache-2.0 |
+| proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
+| quote | 1.0.47 | MIT OR Apache-2.0 |
 | rayon | 1.12.0 | MIT OR Apache-2.0 |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 |
 | rusqlite | 0.40.2 | MIT |
+| rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| serde | 1.0.229 | MIT OR Apache-2.0 |
+| serde_core | 1.0.229 | MIT OR Apache-2.0 |
+| serde_derive | 1.0.229 | MIT OR Apache-2.0 |
+| serde_spanned | 1.1.2 | MIT OR Apache-2.0 |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
 | smallvec | 1.16.3 | MIT OR Apache-2.0 |
+| syn | 3.0.9 | MIT OR Apache-2.0 |
+| tempfile | 3.27.0 | MIT OR Apache-2.0 |
 | tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT |
+| toml | 1.1.8+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_datetime | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_parser | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_writer | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
+| unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-normalization | 0.1.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
+| winnow | 1.0.4 | MIT |
 
-25 crates. Distinct license expressions: `(MIT OR Apache-2.0) AND Unicode-3.0`; `MIT`; `MIT OR Apache-2.0`; `MIT/Apache-2.0`; `Unlicense OR MIT`; `Zlib`; `Zlib OR Apache-2.0 OR MIT`
+49 crates. Distinct license expressions: `(MIT OR Apache-2.0) AND Unicode-3.0`; `Apache-2.0 OR MIT`; `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; `MIT`; `MIT OR Apache-2.0`; `MIT/Apache-2.0`; `Unlicense OR MIT`; `Zlib`; `Zlib OR Apache-2.0 OR MIT`

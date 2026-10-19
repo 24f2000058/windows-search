@@ -28,10 +28,11 @@
 | Crate | Purpose | Platform |
 |---|---|---|
 | `flint-fuzzy` | folding, kernels, `NameTable`, query parser, engine, session | any |
-| `flint-index` | journal model, volume state machine, SQLite store, traversal, NTFS simulator | any |
-| `flint-ntfs` | USN record parser (any); Win32 `NtfsVolume` + `ntfs_probe` (Windows) | Windows for `win` |
+| `flint-index` | journal model, volume state machine, SQLite store, snapshots, catalog (per-volume workers), traversal + reconciliation, NTFS simulator | any |
+| `flint-ntfs` | USN and raw `$MFT` parsers (any); Win32 `NtfsVolume`, `DirWatcher` and `ntfs_probe` (Windows) | Windows for `win`, `watch` |
 | `flint-commands` | command registry, `/s`, calculator | any |
-| `flint-ui-win32` | UI spike; `model` (any) + `win` (Windows) | Windows |
+| `flint-config` | versioned settings, migrations/recovery, data paths, hotkey parsing | any |
+| `flint-ui-win32` | launcher UI; `model`, `discovery` (any) + `win`, `volumes`, `theme`, `icons` (Windows) | Windows |
 | `flint-bench` | engine, kernel, index benchmarks; corpus generator | any |
 
 ## Key invariants
@@ -51,9 +52,25 @@
 * **Exhaustion scope.** `indexed_exhausted` refers to indexed candidates only;
   the UI adds index coverage separately.
 
+## Startup sequence
+
+1. Resolve the data directory (installed or portable) and load the config.
+   Load never fails; problems surface in the status line.
+2. Create the window and register the configured hotkey; a taken hotkey is
+   reported in the status line.
+3. Start the catalog, then plan volumes on a background thread.
+4. Each volume worker loads its snapshot (or falls back to SQLite), then
+   syncs (journal), or walks and watches (traversal).
+5. On exit, workers stop and write their snapshots.
+
 ## Threads at idle
 
-UI thread (blocked in `GetMessage`), search worker (blocked on a channel) and
-the rayon pool (parked). Indexing threads exist only while work is pending;
-journal polling cadence is a phase-2 decision (event-driven with
-`BytesToWaitFor`, or a low-frequency timer).
+UI thread (blocked in `GetMessage`), search worker (blocked on a channel),
+the rayon pool (parked), and one catalog worker per volume:
+
+* a journal volume polls once per second (an empty poll does no disk
+  write)
+* a watched volume blocks in `ReadDirectoryChangesW`
+
+Idle CPU still has to be measured on Windows. `BytesToWaitFor` would remove
+the journal poll entirely.
