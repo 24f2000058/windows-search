@@ -25,7 +25,27 @@ use std::time::{Duration, Instant};
 
 pub enum Backend {
     Journal(Box<dyn JournalSource + Send>),
+    /// Periodic full traversal (no change notifications available).
     Traversal(TraversalSource<Box<dyn Fs + Send>>),
+    /// Traversal once, then incremental reconciliation driven by a change
+    /// feed (e.g. `ReadDirectoryChangesW`). The feed must be started before
+    /// the traversal so no change is missed in between.
+    Watched(TraversalSource<Box<dyn Fs + Send>>, Box<dyn ChangeFeed>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FeedEvent {
+    Idle,
+    /// Volume-relative directories whose contents changed.
+    Dirs(Vec<PathBuf>),
+    /// Notifications were lost (buffer overflow): a full traversal is needed.
+    Overflow,
+    Failed(String),
+}
+
+pub trait ChangeFeed: Send {
+    /// Waits up to `timeout` for changes.
+    fn poll(&mut self, timeout: Duration) -> FeedEvent;
 }
 
 /// Opens a volume's backend. Called again after every failure. `journal_failed`
@@ -414,6 +434,48 @@ impl WorkerCtx {
                         }
                     }
                     self.opts.traversal_rescan.unwrap_or(Duration::from_secs(3600)).min(Duration::from_secs(60))
+                }
+                Backend::Watched(src, feed) => {
+                    if traversed_at.is_none() {
+                        src.cancel = self.stop.clone();
+                        self.set(|s| s.phase = Phase::Indexing);
+                        match ix.sync_traversal(src, &mut store, &self.table, &self.stop) {
+                            Ok(rep) => {
+                                traversed_at = Some(Instant::now());
+                                self.set(|s| {
+                                    s.phase = Phase::Traversed { complete: rep.complete() };
+                                    s.state = ix.state.clone();
+                                });
+                            }
+                            Err(SyncError::Canceled) => break,
+                            Err(e) => {
+                                backend = None;
+                                self.set(|s| s.phase = Phase::Waiting(format!("{e:?}")));
+                            }
+                        }
+                        Duration::ZERO
+                    } else {
+                        // The feed's own wait paces this loop.
+                        match feed.poll(self.opts.poll) {
+                            FeedEvent::Idle => {}
+                            FeedEvent::Dirs(dirs) => match ix.reconcile(src, &dirs, &mut store, &self.table) {
+                                Ok(_) => self.set(|s| {
+                                    s.phase = Phase::Traversed { complete: ix.state.is_complete() };
+                                    s.state = ix.state.clone();
+                                }),
+                                Err(e) => {
+                                    backend = None;
+                                    self.set(|s| s.phase = Phase::Waiting(format!("{e:?}")));
+                                }
+                            },
+                            FeedEvent::Overflow => traversed_at = None,
+                            FeedEvent::Failed(why) => {
+                                backend = None;
+                                self.set(|s| s.phase = Phase::Waiting(format!("change notifications failed: {why}")));
+                            }
+                        }
+                        Duration::ZERO
+                    }
                 }
             };
             last_seq = store.commit_seq_for(&self.spec.key).unwrap_or(last_seq);

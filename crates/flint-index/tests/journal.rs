@@ -533,3 +533,57 @@ fn idle_sync_does_not_write() {
     app.sync(&mut sim).unwrap();
     assert!(app.ix.stats.batches_committed > before);
 }
+
+#[cfg(unix)]
+#[test]
+fn reconcile_tracks_filesystem_changes_incrementally() {
+    use flint_index::traverse::{RealFs, TraversalSource};
+    let d = std::env::temp_dir().join(format!("flint-recon-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    for p in ["a/b", "c", "gone/deep"] {
+        std::fs::create_dir_all(d.join(p)).unwrap();
+    }
+    for f in ["a/one.txt", "a/b/two.txt", "c/three.txt", "gone/deep/x.txt", "file_becomes_dir"] {
+        std::fs::write(d.join(f), b"1").unwrap();
+    }
+    let db = db_path("reconcile");
+    let (mut store, _) = Store::open(&db).unwrap();
+    let table = RwLock::new(NameTable::new());
+    let mut src = TraversalSource::new(d.clone(), RealFs);
+    let mut ix = VolumeIndexer::open(&mut store, &table, 1, "recon", "R:", src.root_frn).unwrap();
+    ix.sync_traversal(&mut src, &mut store, &table, &AtomicBool::new(false)).unwrap();
+    let truth = |d: &std::path::Path| {
+        let mut s = TraversalSource::new(d.to_path_buf(), RealFs);
+        let mut t = NameTable::new();
+        let mut v = VolumeIndex::new(&mut t, 1, s.root_frn, "R:");
+        let mut ch = Changes::default();
+        s.walk(&mut |r| {
+            v.apply_record(&mut t, &r, &mut ch);
+            true
+        });
+        v.paths(&t)
+    };
+    // Mutate: add, delete subtree, rename dir, grow file, file -> dir, new deep tree.
+    std::fs::write(d.join("a/new.md"), b"hello").unwrap();
+    std::fs::remove_dir_all(d.join("gone")).unwrap();
+    std::fs::rename(d.join("a/b"), d.join("a/b-renamed")).unwrap();
+    std::fs::write(d.join("c/three.txt"), b"much longer content").unwrap();
+    std::fs::remove_file(d.join("file_becomes_dir")).unwrap();
+    std::fs::create_dir_all(d.join("file_becomes_dir/inner/more")).unwrap();
+    std::fs::write(d.join("file_becomes_dir/inner/more/leaf.rs"), b"x").unwrap();
+    let changed: Vec<PathBuf> = ["a", "", "c"].iter().map(PathBuf::from).collect();
+    let rep = ix.reconcile(&mut src, &changed, &mut store, &table).unwrap();
+    assert_eq!(ix.index.paths(&table.read().unwrap()), truth(&d), "{rep:?}");
+    assert!(rep.updated >= 1 && rep.removed >= 3 && rep.added >= 5, "{rep:?}");
+    // A change inside a directory the index never saw resolves to an ancestor.
+    std::fs::create_dir_all(d.join("brand/new/place")).unwrap();
+    std::fs::write(d.join("brand/new/place/z.txt"), b"z").unwrap();
+    ix.reconcile(&mut src, &[PathBuf::from("brand/new/place")], &mut store, &table).unwrap();
+    assert_eq!(ix.index.paths(&table.read().unwrap()), truth(&d));
+    // Persisted: a restart sees the same tree, and new ids never collided.
+    drop(ix);
+    let t2 = RwLock::new(NameTable::new());
+    let ix2 = VolumeIndexer::open(&mut store, &t2, 1, "recon", "R:", src.root_frn).unwrap();
+    assert_eq!(ix2.index.paths(&t2.read().unwrap()), truth(&d));
+    let _ = std::fs::remove_dir_all(&d);
+}

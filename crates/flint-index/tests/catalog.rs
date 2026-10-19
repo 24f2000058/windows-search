@@ -187,3 +187,43 @@ fn shutdown_is_prompt_even_mid_indexing() {
     cat.shutdown();
     assert!(t.elapsed() < Duration::from_secs(5), "shutdown took {:?}", t.elapsed());
 }
+
+struct FakeFeed(std::sync::mpsc::Receiver<FeedEvent>);
+impl ChangeFeed for FakeFeed {
+    fn poll(&mut self, timeout: Duration) -> FeedEvent {
+        self.0.recv_timeout(timeout).unwrap_or(FeedEvent::Idle)
+    }
+}
+
+#[test]
+fn watched_volume_reconciles_changes_and_recovers_from_overflow() {
+    let dir = tmpdir("watched");
+    let tree = dir.join("usb");
+    std::fs::create_dir_all(tree.join("photos")).unwrap();
+    std::fs::write(tree.join("photos/a.jpg"), b"x").unwrap();
+    let table = Arc::new(RwLock::new(NameTable::new()));
+    let cat = Catalog::new(table.clone(), dir.join("index.db"), None, opts(), Arc::new(|| {})).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let feed = Arc::new(std::sync::Mutex::new(Some(rx)));
+    let t2 = tree.clone();
+    let root_frn = TraversalSource::new(tree.clone(), RealFs).root_frn;
+    cat.add(
+        VolumeSpec { key: "exfat".into(), root_name: "X:".into(), root_frn },
+        Box::new(move |_| {
+            let rx = feed.lock().unwrap().take().ok_or(SourceError::Unavailable("feed used".into()))?;
+            Ok(Backend::Watched(TraversalSource::new(t2.clone(), Box::new(RealFs) as Box<dyn Fs + Send>), Box::new(FakeFeed(rx))))
+        }),
+    );
+    wait_until("initial traversal", || names(&table).contains("X:\\photos\\a.jpg"));
+    std::fs::write(tree.join("photos/b.jpg"), b"y").unwrap();
+    std::fs::remove_file(tree.join("photos/a.jpg")).unwrap();
+    tx.send(FeedEvent::Dirs(vec![PathBuf::from("photos")])).unwrap();
+    wait_until("incremental update", || {
+        let n = names(&table);
+        n.contains("X:\\photos\\b.jpg") && !n.contains("X:\\photos\\a.jpg")
+    });
+    std::fs::write(tree.join("late.txt"), b"z").unwrap();
+    tx.send(FeedEvent::Overflow).unwrap();
+    wait_until("full rescan after overflow", || names(&table).contains("X:\\late.txt"));
+    assert!(cat.coverage().complete, "{:?}", cat.coverage());
+}

@@ -61,7 +61,7 @@ pub struct Stats {
 pub struct VolumeIndexer {
     pub key: String,
     pub root_name: String,
-    db_id: i64,
+    pub(crate) db_id: i64,
     pub index: VolumeIndex,
     /// Persisted state (mirrors the store).
     pub state: VolumeState,
@@ -73,7 +73,9 @@ pub struct VolumeIndexer {
     /// In-memory state is known to equal the committed store state (false
     /// after a failed sync until the next successful one). Snapshots are only
     /// written while true.
-    consistent: bool,
+    pub(crate) consistent: bool,
+    /// Next synthetic FRN segment for traversal volumes (0 = not computed).
+    pub(crate) synthetic_next: u64,
 }
 
 /// Where a volume's entries came from at startup.
@@ -107,7 +109,7 @@ impl VolumeIndexer {
                             Ok(base) => match VolumeIndex::adopt(&t, volume, root_frn, base, n) {
                                 Ok(index) => {
                                     drop(t);
-                                    let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats: Stats::default(), progress: Arc::default(), consistent: true };
+                                    let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats: Stats::default(), progress: Arc::default(), consistent: true, synthetic_next: 0 };
                                     return Ok((ix, LoadSource::Snapshot));
                                 }
                                 Err(e) => {
@@ -134,7 +136,7 @@ impl VolumeIndexer {
         let mut stats = Stats::default();
         // A consistent store yields no orphans; any are repaired on sync.
         stats.inconsistencies += index.orphan_count() as u64;
-        let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: Arc::default(), consistent: true };
+        let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: Arc::default(), consistent: true, synthetic_next: 0 };
         Ok((ix, LoadSource::Store { why }))
     }
 
@@ -281,6 +283,7 @@ impl VolumeIndexer {
         self.stats.rescans += 1;
         self.persist_state(store, true, VolumeState::Traversal { complete: false, skipped: 0 })?;
         let r = self.enumerate_into(src, store, table, cancel);
+        self.synthetic_next = 0;
         let report = src.report.clone();
         self.consistent = r.is_ok();
         if let Err(e) = r {

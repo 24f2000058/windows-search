@@ -6,4 +6,6 @@
 pub mod mft;
 pub mod records;
 #[cfg(windows)]
+pub mod watch;
+#[cfg(windows)]
 pub mod win;

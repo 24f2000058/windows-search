@@ -94,7 +94,7 @@ pub const MAX_DEPTH: usize = 512;
 pub struct TraversalSource<F: Fs = RealFs> {
     pub root: PathBuf,
     pub root_frn: Frn,
-    fs: F,
+    pub fs: F,
     pub report: TraversalReport,
     pub cancel: Arc<AtomicBool>,
 }
@@ -108,7 +108,15 @@ impl<F: Fs> TraversalSource<F> {
     pub fn walk(&mut self, sink: &mut dyn FnMut(FileRecord) -> bool) {
         self.report = TraversalReport::default();
         let mut next_seg = 2u64;
-        let mut stack: Vec<(PathBuf, Frn, usize)> = vec![(self.root.clone(), self.root_frn, 0)];
+        let root = self.root.clone();
+        self.walk_from(root, self.root_frn, 0, &mut next_seg, sink);
+    }
+
+    /// Walks the subtree under `dir` (whose identity is `dir_frn`), emitting
+    /// its descendants and allocating synthetic FRNs from `next_seg`. The
+    /// report accumulates (call [`walk`](Self::walk) to reset it).
+    pub fn walk_from(&mut self, dir: PathBuf, dir_frn: Frn, depth: usize, next_seg: &mut u64, sink: &mut dyn FnMut(FileRecord) -> bool) {
+        let mut stack: Vec<(PathBuf, Frn, usize)> = vec![(dir, dir_frn, depth)];
         while let Some((dir, dir_frn, depth)) = stack.pop() {
             if self.cancel.load(Ordering::Relaxed) {
                 self.report.canceled = true;
@@ -136,8 +144,8 @@ impl<F: Fs> TraversalSource<F> {
                         item.name.to_string_lossy().into_owned()
                     }
                 };
-                next_seg += 1;
-                let frn = make_frn(next_seg, 1);
+                *next_seg += 1;
+                let frn = make_frn(*next_seg, 1);
                 let mut attrs = 0;
                 if item.is_dir {
                     attrs |= attr::DIRECTORY;
