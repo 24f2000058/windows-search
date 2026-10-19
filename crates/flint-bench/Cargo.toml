@@ -1,0 +1,9 @@
+[package]
+name = "flint-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flint-fuzzy = { version = "0.1.0", path = "../flint-fuzzy" }
+flint-index = { version = "0.1.0", path = "../flint-index" }
+rayon = "1.12.0"
