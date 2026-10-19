@@ -11,6 +11,7 @@
 //! `flint_index::model::validate` maps to the traversal fallback. See the
 //! elevation ADR for the optional helper/service design.
 
+use crate::mft::{data_runs_of, parse_record, Assembler};
 use crate::records::{filetime_to_unix, parse_buffer};
 use flint_index::model::{FileRecord, Frn, JournalInfo, SourceError, UsnRecord};
 use flint_index::source::JournalSource;
@@ -126,7 +127,22 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
     out
 }
 
+/// Outcome of the last raw `$MFT` read (diagnostics).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MftStats {
+    pub records: u64,
+    pub in_use: u64,
+    /// Records failing fixup/structure checks.
+    pub rejected: u64,
+    pub bytes: u64,
+    pub stopped: bool,
+}
+
+const MFT_CHUNK: usize = 4 << 20;
+
 pub struct NtfsVolume {
+    pub last_mft: Option<MftStats>,
+    pub last_mft_error: Option<String>,
     volume: Handle,
     pub info: VolumeInfo,
     pub root_frn: Frn,
@@ -169,7 +185,7 @@ impl NtfsVolume {
         let volume = open_path(&dev, GENERIC_READ)?;
         let root = open_path(&info.guid_path, FILE_READ_ATTRIBUTES)?;
         let root_frn = frn_of(&file_info(root.0)?);
-        Ok(NtfsVolume { volume, info, root_frn, buf: vec![0u8; BUF_SIZE] })
+        Ok(NtfsVolume { last_mft: None, last_mft_error: None, volume, info, root_frn, buf: vec![0u8; BUF_SIZE] })
     }
 
     fn ioctl<T>(&mut self, code: u32, input: &T) -> Result<usize, u32> {
@@ -203,27 +219,11 @@ impl NtfsVolume {
         Ok(Some(h))
     }
 
-    fn mount(&self) -> Result<String, SourceError> {
-        self.info.mount_points.first().map(|m| m.trim_end_matches('\\').to_owned()).ok_or_else(|| SourceError::Unavailable("volume has no mount point".into()))
-    }
-}
-
-impl JournalSource for NtfsVolume {
-    fn query(&mut self) -> Result<JournalInfo, SourceError> {
-        let mut ret = 0u32;
-        let mut d: USN_JOURNAL_DATA_V0 = unsafe { std::mem::zeroed() };
-        let ok = unsafe { DeviceIoControl(self.volume.0, FSCTL_QUERY_USN_JOURNAL, null(), 0, &mut d as *mut _ as *mut c_void, std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32, &mut ret, null_mut()) };
-        if ok == 0 {
-            return Err(last_error());
-        }
-        Ok(JournalInfo { journal_id: d.UsnJournalID, lowest_valid_usn: d.LowestValidUsn, first_usn: d.FirstUsn, next_usn: d.NextUsn })
-    }
-
     /// Uses `FSCTL_ENUM_USN_DATA`. Provides names/parents/attributes only
     /// (size and mtime are refreshed lazily). Unverified: whether files with
     /// several hard links yield one record per link; the index tolerates
     /// either, and HARD_LINK_CHANGE/link refresh reconcile later.
-    fn enumerate(&mut self, sink: &mut dyn FnMut(FileRecord) -> bool) -> Result<(), SourceError> {
+    pub fn enumerate_usn_data(&mut self, sink: &mut dyn FnMut(FileRecord) -> bool) -> Result<(), SourceError> {
         let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: i64::MAX };
         loop {
             let n = match self.ioctl(FSCTL_ENUM_USN_DATA, &med) {
@@ -246,6 +246,123 @@ impl JournalSource for NtfsVolume {
                 _ => return Ok(()),
             }
         }
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, SourceError> {
+        if unsafe { SetFilePointerEx(self.volume.0, offset as i64, null_mut(), FILE_BEGIN) } == 0 {
+            return Err(last_error());
+        }
+        let mut got = 0u32;
+        if unsafe { ReadFile(self.volume.0, buf.as_mut_ptr(), buf.len() as u32, &mut got, null_mut()) } == 0 {
+            return Err(last_error());
+        }
+        Ok(got as usize)
+    }
+
+    /// Streams the `$MFT` sequentially in large cluster-aligned chunks.
+    /// Status: compile-checked only; validate with `ntfs_probe` on hardware.
+    pub fn enumerate_mft(&mut self, sink: &mut dyn FnMut(FileRecord) -> bool) -> Result<MftStats, SourceError> {
+        let mut vd: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
+        let mut ret = 0u32;
+        let ok = unsafe { DeviceIoControl(self.volume.0, FSCTL_GET_NTFS_VOLUME_DATA, null(), 0, &mut vd as *mut _ as *mut c_void, std::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32, &mut ret, null_mut()) };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        let (bpc, rs, sector) = (vd.BytesPerCluster as u64, vd.BytesPerFileRecordSegment as usize, vd.BytesPerSector as usize);
+        let aligned = bpc.is_multiple_of(rs as u64) || (rs as u64).is_multiple_of(bpc.max(1));
+        if bpc == 0 || rs < 512 || sector < 512 || !rs.is_multiple_of(sector) || !aligned {
+            return Err(SourceError::Io(format!("unexpected NTFS geometry: cluster {bpc}, record {rs}, sector {sector}")));
+        }
+        let mut rec0 = vec![0u8; rs.max(sector)];
+        self.read_at(vd.MftStartLcn as u64 * bpc, &mut rec0)?;
+        let runs = data_runs_of(&mut rec0[..rs], sector).map_err(|e| SourceError::Io(format!("$MFT record 0: {e:?}")))?;
+        let total_records = (vd.MftValidDataLength as u64) / rs as u64;
+        let mut stats = MftStats::default();
+        let mut asm = Assembler::default();
+        let stop = std::cell::Cell::new(false);
+        let mut emit = |f: FileRecord| {
+            if !stop.get() && !sink(f) {
+                stop.set(true);
+            }
+        };
+        let chunk_bytes = (MFT_CHUNK as u64 / bpc.max(rs as u64)).max(1) * bpc.max(rs as u64);
+        let mut buf = vec![0u8; chunk_bytes as usize];
+        let mut segment = 0u64;
+        'extents: for (lcn, clusters) in runs {
+            let extent_bytes = clusters * bpc;
+            let Some(lcn) = lcn else {
+                segment += extent_bytes / rs as u64;
+                continue;
+            };
+            let mut done = 0u64;
+            while done < extent_bytes {
+                if segment >= total_records {
+                    break 'extents;
+                }
+                let want = (extent_bytes - done).min(chunk_bytes) as usize;
+                let got = self.read_at(lcn as u64 * bpc + done, &mut buf[..want])?;
+                if got == 0 {
+                    break 'extents;
+                }
+                for rec in buf[..got - got % rs].chunks_exact_mut(rs) {
+                    if segment >= total_records {
+                        break;
+                    }
+                    match parse_record(rec, segment, sector) {
+                        Ok(Some(e)) => {
+                            stats.in_use += 1;
+                            asm.add(e, &mut emit);
+                        }
+                        Ok(None) => {}
+                        Err(_) => stats.rejected += 1,
+                    }
+                    segment += 1;
+                    stats.records += 1;
+                }
+                done += got as u64;
+                stats.bytes += got as u64;
+                if stop.get() {
+                    stats.stopped = true;
+                    return Ok(stats);
+                }
+            }
+        }
+        asm.finish(&mut emit);
+        stats.stopped = stop.get();
+        Ok(stats)
+    }
+
+    fn mount(&self) -> Result<String, SourceError> {
+        self.info.mount_points.first().map(|m| m.trim_end_matches('\\').to_owned()).ok_or_else(|| SourceError::Unavailable("volume has no mount point".into()))
+    }
+}
+
+impl JournalSource for NtfsVolume {
+    fn query(&mut self) -> Result<JournalInfo, SourceError> {
+        let mut ret = 0u32;
+        let mut d: USN_JOURNAL_DATA_V0 = unsafe { std::mem::zeroed() };
+        let ok = unsafe { DeviceIoControl(self.volume.0, FSCTL_QUERY_USN_JOURNAL, null(), 0, &mut d as *mut _ as *mut c_void, std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32, &mut ret, null_mut()) };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        Ok(JournalInfo { journal_id: d.UsnJournalID, lowest_valid_usn: d.LowestValidUsn, first_usn: d.FirstUsn, next_usn: d.NextUsn })
+    }
+
+    /// Reads the raw `$MFT` (names of every link, sizes, times). If it
+    /// cannot be read, or any record was rejected (torn by a concurrent write
+    /// or corrupt), `FSCTL_ENUM_USN_DATA` runs as well so no file is missed;
+    /// applying both is idempotent.
+    fn enumerate(&mut self, sink: &mut dyn FnMut(FileRecord) -> bool) -> Result<(), SourceError> {
+        match self.enumerate_mft(sink) {
+            Ok(stats) => {
+                self.last_mft = Some(stats);
+                if stats.rejected == 0 || stats.stopped {
+                    return Ok(());
+                }
+            }
+            Err(e) => self.last_mft_error = Some(format!("{e:?}")),
+        }
+        self.enumerate_usn_data(sink)
     }
 
     fn read(&mut self, journal_id: u64, from_usn: i64, max: usize) -> Result<(Vec<UsnRecord>, i64), SourceError> {

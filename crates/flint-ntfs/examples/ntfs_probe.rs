@@ -37,6 +37,17 @@ fn main() {
         Ok(j) => println!("journal: {j:?}"),
         Err(e) => println!("journal query failed: {e:?}"),
     }
+    // Raw $MFT read on its own, then the combined enumeration used by the index.
+    let s = Instant::now();
+    let (mut mn, mut sized) = (0u64, 0u64);
+    let r = vol.enumerate_mft(&mut |rec| {
+        mn += 1;
+        if rec.size.is_some_and(|x| x > 0) {
+            sized += 1;
+        }
+        true
+    });
+    println!("raw $MFT: {r:?}, {mn} link records ({sized} with size) in {:.2}s", s.elapsed().as_secs_f64());
     let s = Instant::now();
     let (mut n, mut dirs, mut per_frn): (u64, u64, HashMap<u64, u32>) = (0, 0, HashMap::new());
     let r = vol.enumerate(&mut |rec| {
@@ -49,7 +60,14 @@ fn main() {
     });
     let multi = per_frn.values().filter(|&&c| c > 1).count();
     println!("enumerate: {r:?}, {n} records ({dirs} dirs) in {:.2}s", s.elapsed().as_secs_f64());
-    println!("  FRNs with >1 enumeration record (hard links reported per link?): {multi}");
+    println!("  FRNs with >1 enumeration record (hard links): {multi}; MFT stats {:?}, MFT error {:?}", vol.last_mft, vol.last_mft_error);
+    let s = Instant::now();
+    let mut un = 0u64;
+    let r = vol.enumerate_usn_data(&mut |_| {
+        un += 1;
+        true
+    });
+    println!("FSCTL_ENUM_USN_DATA alone: {r:?}, {un} records in {:.2}s (compare link counts with raw $MFT)", s.elapsed().as_secs_f64());
     if let Ok(j) = vol.query() {
         let s = Instant::now();
         let from = (j.next_usn - 1_000_000).max(j.lowest_valid_usn);
