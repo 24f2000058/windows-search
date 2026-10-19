@@ -34,6 +34,12 @@ pub trait Fs {
     fn list(&self, dir: &Path) -> io::Result<Vec<io::Result<DirItem>>>;
 }
 
+impl<T: Fs + ?Sized> Fs for Box<T> {
+    fn list(&self, dir: &Path) -> io::Result<Vec<io::Result<DirItem>>> {
+        (**self).list(dir)
+    }
+}
+
 pub struct RealFs;
 
 impl Fs for RealFs {

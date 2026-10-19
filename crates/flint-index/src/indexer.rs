@@ -18,8 +18,8 @@ use crate::volume::{Changes, Followup, VolumeIndex};
 use flint_fuzzy::table::NameTable;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub const ENUM_BATCH: usize = 50_000;
 pub const READ_BATCH: usize = 4096;
@@ -68,8 +68,8 @@ pub struct VolumeIndexer {
     /// Transient condition preventing the index from being current.
     pub runtime: Option<String>,
     pub stats: Stats,
-    /// Enumeration progress (links seen) while enumerating.
-    pub progress: u64,
+    /// Enumeration progress (links seen), readable while a sync runs.
+    pub progress: Arc<AtomicU64>,
     /// In-memory state is known to equal the committed store state (false
     /// after a failed sync until the next successful one). Snapshots are only
     /// written while true.
@@ -107,7 +107,7 @@ impl VolumeIndexer {
                             Ok(base) => match VolumeIndex::adopt(&t, volume, root_frn, base, n) {
                                 Ok(index) => {
                                     drop(t);
-                                    let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats: Stats::default(), progress: 0, consistent: true };
+                                    let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats: Stats::default(), progress: Arc::default(), consistent: true };
                                     return Ok((ix, LoadSource::Snapshot));
                                 }
                                 Err(e) => {
@@ -134,7 +134,7 @@ impl VolumeIndexer {
         let mut stats = Stats::default();
         // A consistent store yields no orphans; any are repaired on sync.
         stats.inconsistencies += index.orphan_count() as u64;
-        let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: 0, consistent: true };
+        let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: Arc::default(), consistent: true };
         Ok((ix, LoadSource::Store { why }))
     }
 
@@ -221,13 +221,13 @@ impl VolumeIndexer {
     /// in batches, then resolves parents still missing.
     fn enumerate_into(&mut self, src: &mut dyn JournalSource, store: &mut Store, table: &RwLock<NameTable>, cancel: &AtomicBool) -> Result<(), SyncError> {
         self.index.clear(&mut table.write().unwrap());
-        self.progress = 0;
+        self.progress.store(0, Ordering::Relaxed);
 
         let mut batch: Vec<FileRecord> = Vec::with_capacity(ENUM_BATCH);
         let mut failure: Option<SyncError> = None;
         let mut canceled = false;
         let db_id = self.db_id;
-        let (index, stats, progress) = (&mut self.index, &mut self.stats, &mut self.progress);
+        let (index, stats, progress) = (&mut self.index, &mut self.stats, self.progress.clone());
         let mut flush = |batch: &mut Vec<FileRecord>, store: &mut Store| -> Result<(), SyncError> {
             let mut ch = Changes::default();
             {
@@ -241,7 +241,7 @@ impl VolumeIndexer {
             store.commit(db_id, false, &ch.ops, None)?;
             stats.inconsistencies += ch.inconsistencies;
             stats.batches_committed += 1;
-            *progress += batch.len() as u64;
+            progress.fetch_add(batch.len() as u64, Ordering::Relaxed);
             batch.clear();
             Ok(())
         };
@@ -308,6 +308,11 @@ impl VolumeIndexer {
             }
             self.resolve_followups(src, table, &mut ch);
             let live = VolumeState::Live { journal_id, next_usn: next };
+            if recs.is_empty() && ch.ops.is_empty() && self.state == live {
+                // Idle poll: nothing changed. Committing anyway would write
+                // to disk every poll and invalidate snapshots.
+                return Ok(());
+            }
             store.commit(self.db_id, false, &ch.ops, Some(&live))?;
             self.state = live;
             self.stats.records_applied += recs.len() as u64;

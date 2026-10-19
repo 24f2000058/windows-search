@@ -1,6 +1,7 @@
 //! Flint persistent filesystem index: change-journal model, per-volume
 //! journal application, SQLite persistence, recovery and coverage reporting.
 
+pub mod catalog;
 pub mod indexer;
 pub mod model;
 pub mod sim;

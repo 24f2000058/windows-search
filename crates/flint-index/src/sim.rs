@@ -328,3 +328,46 @@ impl JournalSource for SimVolume {
         Ok(self.files.get(&segment(frn)).filter(|f| f.frn == frn).map(|f| (if f.dir { attr::DIRECTORY } else { 0 }, f.size, f.mtime)))
     }
 }
+
+/// A simulator shared between a test (which mutates it) and an indexer
+/// worker (which reads it as a journal source).
+#[derive(Clone)]
+pub struct SharedSim(pub std::sync::Arc<std::sync::Mutex<SimVolume>>);
+
+impl SharedSim {
+    pub fn new(sim: SimVolume) -> Self {
+        SharedSim(std::sync::Arc::new(std::sync::Mutex::new(sim)))
+    }
+    pub fn with<R>(&self, f: impl FnOnce(&mut SimVolume) -> R) -> R {
+        f(&mut self.0.lock().unwrap())
+    }
+}
+
+impl JournalSource for SharedSim {
+    fn query(&mut self) -> Result<JournalInfo, SourceError> {
+        self.0.lock().unwrap().query()
+    }
+    fn enumerate(&mut self, sink: &mut dyn FnMut(FileRecord) -> bool) -> Result<(), SourceError> {
+        // Snapshot the records first so the lock is not held while indexing.
+        let mut recs = Vec::new();
+        self.0.lock().unwrap().enumerate(&mut |r| {
+            recs.push(r);
+            true
+        })?;
+        for r in recs {
+            if !sink(r) {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn read(&mut self, journal_id: u64, from_usn: i64, max: usize) -> Result<(Vec<UsnRecord>, i64), SourceError> {
+        self.0.lock().unwrap().read(journal_id, from_usn, max)
+    }
+    fn links(&mut self, frn: Frn) -> Result<Vec<FileRecord>, SourceError> {
+        self.0.lock().unwrap().links(frn)
+    }
+    fn meta(&mut self, frn: Frn) -> Result<Option<(u32, u64, i64)>, SourceError> {
+        self.0.lock().unwrap().meta(frn)
+    }
+}

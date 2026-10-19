@@ -21,13 +21,18 @@ pub const SCHEMA_VERSION: i64 = 2;
 pub enum StoreError {
     Sqlite(rusqlite::Error),
     NewerSchema(i64),
+    /// The file is not a database or failed the integrity check.
+    Corrupt(String),
     /// Fault injection: simulated crash before commit.
     InjectedFault,
 }
 
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
-        StoreError::Sqlite(e)
+        match e.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => StoreError::Corrupt(e.to_string()),
+            _ => StoreError::Sqlite(e),
+        }
     }
 }
 
@@ -36,6 +41,7 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::NewerSchema(v) => write!(f, "index database schema {v} is newer than supported {SCHEMA_VERSION}"),
+            StoreError::Corrupt(e) => write!(f, "index database is corrupt: {e}"),
             StoreError::InjectedFault => write!(f, "injected fault"),
         }
     }
@@ -89,8 +95,9 @@ impl Store {
         let existed = path.exists();
         match Self::try_open(path) {
             Ok((s, outcome)) => Ok((s, if existed { outcome } else { OpenOutcome::Created })),
-            Err(StoreError::NewerSchema(v)) => Err(StoreError::NewerSchema(v)),
-            Err(_) if existed => {
+            // Only genuine corruption moves the file aside; transient errors
+            // (locked, I/O, permissions) are returned so nothing is lost.
+            Err(StoreError::Corrupt(_)) if existed => {
                 let moved_to = path.with_extension(format!("corrupt-{}", std::process::id()));
                 let _ = std::fs::rename(path, &moved_to);
                 for ext in ["db-wal", "db-shm"] {
@@ -112,11 +119,13 @@ impl Store {
 
     fn try_open(path: &Path) -> Result<(Store, OpenOutcome)> {
         let conn = Connection::open(path)?;
+        // Several per-volume workers share the file; wait for each other.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         let ok: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if ok != "ok" {
-            return Err(StoreError::Sqlite(rusqlite::Error::InvalidQuery));
+            return Err(StoreError::Corrupt(ok));
         }
         let mut s = Store { conn, fail_after_ops: None };
         let outcome = s.migrate()?;
@@ -131,7 +140,13 @@ impl Store {
         if v == SCHEMA_VERSION {
             return Ok(OpenOutcome::Opened);
         }
-        let tx = self.conn.transaction()?;
+        // IMMEDIATE takes the write lock up front, so concurrent openers
+        // migrate one at a time; re-read the version under the lock.
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v == SCHEMA_VERSION {
+            return Ok(OpenOutcome::Opened);
+        }
         if v < 1 {
             tx.execute_batch(SCHEMA_V1)?;
         }
@@ -228,6 +243,11 @@ impl Store {
         Ok(self.conn.query_row("SELECT commit_seq FROM volumes WHERE id = ?1", [vol], |r| r.get::<_, i64>(0))? as u64)
     }
 
+    /// [`commit_seq`](Self::commit_seq) by volume key (0 if unknown).
+    pub fn commit_seq_for(&self, key: &str) -> Result<u64> {
+        Ok(self.conn.query_row("SELECT commit_seq FROM volumes WHERE key = ?1", [key], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0) as u64)
+    }
+
     pub fn entry_count(&self, vol: i64) -> Result<i64> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM entries WHERE volume_id = ?1", [vol], |r| r.get(0))?)
     }
@@ -284,6 +304,19 @@ mod tests {
         assert_eq!(s.commit_seq(v).unwrap(), 1);
         drop(s);
         assert_eq!(Store::open(&p).unwrap().1, OpenOutcome::Opened);
+    }
+
+    #[test]
+    fn concurrent_opens_migrate_once_and_never_move_the_file() {
+        let p = tmp("concurrent");
+        let _ = std::fs::remove_file(&p);
+        let handles: Vec<_> = (0..8).map(|_| {
+            let p = p.clone();
+            std::thread::spawn(move || Store::open(&p).map(|(_, o)| o).map_err(|e| e.to_string()))
+        }).collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(outcomes.iter().all(|o| matches!(o, Ok(OpenOutcome::Created | OpenOutcome::Opened))), "{outcomes:?}");
+        assert!(!p.with_extension(format!("corrupt-{}", std::process::id())).exists());
     }
 
     #[test]

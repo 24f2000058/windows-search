@@ -44,7 +44,7 @@ struct App {
 }
 
 impl App {
-    fn start(db: &PathBuf, sim: &SimVolume) -> App {
+    fn start(db: &std::path::Path, sim: &SimVolume) -> App {
         let (mut store, _) = Store::open(db).unwrap();
         let table = RwLock::new(NameTable::new());
         let ix = VolumeIndexer::open(&mut store, &table, 0, KEY, "C:", sim.root).unwrap();
@@ -513,4 +513,23 @@ fn snapshot_not_written_after_failed_sync() {
     assert!(!app.ix.write_snapshot(&app.store, &app.table, &snaps).unwrap(), "memory may be ahead of the store");
     app.sync(&mut sim).unwrap();
     assert!(app.ix.write_snapshot(&app.store, &app.table, &snaps).unwrap());
+}
+
+#[test]
+fn idle_sync_does_not_write() {
+    let mut r = Rng(14);
+    let mut sim = SimVolume::new();
+    populate(&mut sim, &mut r, 200);
+    let db = db_path("idle");
+    let mut app = App::start(&db, &sim);
+    app.sync(&mut sim).unwrap();
+    let before = app.ix.stats.batches_committed;
+    for _ in 0..20 {
+        app.sync(&mut sim).unwrap();
+    }
+    assert_eq!(app.ix.stats.batches_committed, before, "idle polls must not commit");
+    let root = sim.root;
+    sim.create(root, "definitely-new.txt", false).unwrap();
+    app.sync(&mut sim).unwrap();
+    assert!(app.ix.stats.batches_committed > before);
 }
