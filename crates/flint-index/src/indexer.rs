@@ -11,6 +11,7 @@
 
 use crate::model::*;
 use crate::source::JournalSource;
+use crate::traverse::{Fs, TraversalReport, TraversalSource};
 use crate::store::{Store, StoreError};
 use crate::volume::{Changes, Followup, VolumeIndex};
 use flint_fuzzy::table::NameTable;
@@ -143,6 +144,15 @@ impl VolumeIndexer {
         self.stats.last_rescan_reason = Some(reason);
         let q = src.query()?;
         self.persist_state(store, true, VolumeState::Enumerating { journal_id: q.journal_id, start_usn: q.next_usn })?;
+        self.enumerate_into(src, store, table, cancel)?;
+        // Replay changes made while enumerating; the first committed batch
+        // flips the state to Live.
+        self.catch_up(src, store, table, cancel, q.journal_id, q.next_usn)
+    }
+
+    /// Clears the volume and streams a full enumeration into table + store
+    /// in batches, then resolves parents still missing.
+    fn enumerate_into(&mut self, src: &mut dyn JournalSource, store: &mut Store, table: &RwLock<NameTable>, cancel: &AtomicBool) -> Result<(), SyncError> {
         self.index.clear(&mut table.write().unwrap());
         self.progress = 0;
 
@@ -195,9 +205,24 @@ impl VolumeIndexer {
         ch.followups.extend(self.index.orphan_parents().into_iter().map(Followup::Parent));
         self.resolve_followups(src, table, &mut ch);
         store.commit(self.db_id, false, &ch.ops, None)?;
-        // Replay changes made while enumerating; the first committed batch
-        // flips the state to Live.
-        self.catch_up(src, store, table, cancel, q.journal_id, q.next_usn)
+        Ok(())
+    }
+
+    /// Full re-traversal for a journal-less volume. Coverage is persisted as
+    /// complete only if nothing was skipped and the walk was not canceled.
+    pub fn sync_traversal<F: Fs>(&mut self, src: &mut TraversalSource<F>, store: &mut Store, table: &RwLock<NameTable>, cancel: &AtomicBool) -> Result<TraversalReport, SyncError> {
+        self.stats.rescans += 1;
+        self.persist_state(store, true, VolumeState::Traversal { complete: false, skipped: 0 })?;
+        let r = self.enumerate_into(src, store, table, cancel);
+        let report = src.report.clone();
+        if let Err(e) = r {
+            self.runtime = Some(format!("{e:?}"));
+            return Err(e);
+        }
+        let skipped = report.skipped.len() as u64 + report.entry_errors + report.depth_limited;
+        self.persist_state(store, false, VolumeState::Traversal { complete: report.complete(), skipped })?;
+        self.runtime = (!report.complete()).then(|| format!("traversal incomplete: {skipped} unreadable, canceled={}", report.canceled));
+        Ok(report)
     }
 
     fn catch_up(&mut self, src: &mut dyn JournalSource, store: &mut Store, table: &RwLock<NameTable>, cancel: &AtomicBool, journal_id: u64, mut from: i64) -> Result<(), SyncError> {

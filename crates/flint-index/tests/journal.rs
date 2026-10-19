@@ -412,3 +412,34 @@ fn replaying_a_batch_twice_is_idempotent() {
     }
     assert_eq!(v.paths(&t), sim.paths("C:"));
 }
+
+#[cfg(unix)]
+#[test]
+fn traversal_volume_persists_honest_coverage() {
+    use flint_index::traverse::{RealFs, TraversalSource};
+    let d = std::env::temp_dir().join(format!("flint-trav-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("docs/deep")).unwrap();
+    for n in ["docs/a.txt", "docs/deep/b.pdf", "top.md"] {
+        std::fs::write(d.join(n), b"hello").unwrap();
+    }
+    let db = db_path("traversal");
+    let (mut store, _) = Store::open(&db).unwrap();
+    let table = RwLock::new(NameTable::new());
+    let mut src = TraversalSource::new(d.clone(), RealFs);
+    let mut ix = VolumeIndexer::open(&mut store, &table, 1, "trav", "T:", src.root_frn).unwrap();
+    let rep = ix.sync_traversal(&mut src, &mut store, &table, &AtomicBool::new(false)).unwrap();
+    assert!(rep.complete());
+    assert!(ix.is_complete());
+    let paths = ix.index.paths(&table.read().unwrap());
+    assert!(paths.contains("T:\\docs\\deep\\b.pdf"), "{paths:?}");
+    assert_eq!(paths.len(), 5);
+    // Canceled traversal is persisted as incomplete.
+    let canceled = ix.sync_traversal(&mut src, &mut store, &table, &AtomicBool::new(true));
+    assert!(canceled.is_err());
+    assert!(!ix.is_complete());
+    drop(ix);
+    let ix = VolumeIndexer::open(&mut store, &RwLock::new(NameTable::new()), 1, "trav", "T:", src.root_frn).unwrap();
+    assert!(!ix.state.is_complete(), "restart must not see partial traversal as complete");
+    let _ = std::fs::remove_dir_all(&d);
+}
