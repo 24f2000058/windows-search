@@ -58,6 +58,8 @@ pub struct NameTable {
     mtime: Vec<i64>,
     flags: Vec<u8>,
     volume: Vec<u16>,
+    /// Opaque source identity per slot (e.g. NTFS file reference number).
+    key: Vec<u64>,
     live: usize,
     dead_bytes: usize,
     generation: u64,
@@ -111,6 +113,11 @@ impl NameTable {
     }
 
     pub fn push(&mut self, parent: EntryId, name: &str, meta: Meta) -> EntryId {
+        self.push_keyed(parent, name, meta, 0)
+    }
+
+    /// Like [`push`](Self::push), recording an opaque source key for the slot.
+    pub fn push_keyed(&mut self, parent: EntryId, name: &str, meta: Meta, key: u64) -> EntryId {
         let id = self.parent.len() as EntryId;
         assert!(id != NO_PARENT, "table full");
         let (no, nl, fo, fl) = self.intern(name);
@@ -124,6 +131,7 @@ impl NameTable {
         self.mtime.push(meta.mtime);
         self.flags.push(meta.flags & !flags::DEAD);
         self.volume.push(meta.volume);
+        self.key.push(key);
         self.live += 1;
         self.touch(true);
         id
@@ -204,6 +212,20 @@ impl NameTable {
     #[inline]
     pub fn flags(&self, id: EntryId) -> u8 {
         self.flags[id as usize]
+    }
+    #[inline]
+    pub fn key(&self, id: EntryId) -> u64 {
+        self.key[id as usize]
+    }
+    #[inline]
+    pub fn volume(&self, id: EntryId) -> u16 {
+        self.volume[id as usize]
+    }
+
+    /// Live slots whose parent is `id`. O(n): intended for rare repair paths
+    /// (e.g. a directory deleted while the index still holds children).
+    pub fn children_of(&self, id: EntryId) -> Vec<EntryId> {
+        (0..self.len() as EntryId).filter(|&c| self.parent[c as usize] == id && self.is_live(c)).collect()
     }
 
     /// Ancestors from the immediate parent up to the root (cycle-safe).
@@ -313,7 +335,7 @@ impl NameTable {
     /// Approximate heap bytes used by the table.
     pub fn heap_bytes(&self) -> usize {
         self.arena.capacity()
-            + self.parent.capacity() * (4 + 4 + 2 + 4 + 2 + 8 + 8 + 8 + 1 + 2)
+            + self.parent.capacity() * (4 + 4 + 2 + 4 + 2 + 8 + 8 + 8 + 1 + 2 + 8)
             + self.chain_cache.lock().unwrap().as_ref().map_or(0, |c| c.len() * 8)
             + self.dir_cache.lock().unwrap().as_ref().map_or(0, |d| d.dirs.len() * 20 + d.names.len() + d.ord.len() * 4)
     }

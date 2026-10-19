@@ -269,6 +269,58 @@ fn floor(args: &[String]) {
     }
 }
 
+/// Initial index into SQLite, restart load, and incremental journal batch.
+fn index_bench(args: &[String]) {
+    use flint_index::indexer::VolumeIndexer;
+    use flint_index::sim::SimVolume;
+    use flint_index::store::Store;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::RwLock;
+    let n: usize = arg(args, "--n", "1000000").parse().unwrap();
+    let dir = std::env::temp_dir().join(format!("flint-index-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("index.db");
+    let mut r = Rng(42);
+    let mut sim = SimVolume::new();
+    let mut dirs = vec![sim.root];
+    let s = Instant::now();
+    for _ in 0..n {
+        let d = dirs[if r.chance(70) && dirs.len() > 50 { dirs.len() - 1 - r.below(50) } else { r.below(dirs.len()) }];
+        let is_dir = r.chance(10);
+        if let Some(f) = sim.create(d, &corpus::file_name(&mut r), is_dir) {
+            if is_dir {
+                dirs.push(f);
+            }
+        }
+    }
+    println!("simulated volume: {} links in {:.2}s", sim.paths("C:").len(), s.elapsed().as_secs_f64());
+    let (mut store, _) = Store::open(&db).unwrap();
+    let table = RwLock::new(NameTable::new());
+    let mut ix = VolumeIndexer::open(&mut store, &table, 0, "bench", "C:", sim.root).unwrap();
+    let s = Instant::now();
+    ix.sync(&mut sim, &mut store, &table, &AtomicBool::new(false)).unwrap();
+    println!("initial index (enumerate + SQLite write): {:.2}s, live={}", s.elapsed().as_secs_f64(), ix.is_complete());
+    drop((ix, table, store));
+    let size: u64 = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
+    println!("database size (incl. WAL): {:.1} MB", size as f64 / 1e6);
+    let rss0 = rss_kb();
+    let s = Instant::now();
+    let (mut store, _) = Store::open(&db).unwrap();
+    let table = RwLock::new(NameTable::new());
+    let mut ix = VolumeIndexer::open(&mut store, &table, 0, "bench", "C:", sim.root).unwrap();
+    println!("restart load from SQLite: {:.2}s ({} slots), RSS +{:.1} MB", s.elapsed().as_secs_f64(), table.read().unwrap().live_count(), (rss_kb() - rss0) as f64 / 1024.0);
+    let frns = sim.frns();
+    for i in 0..10_000 {
+        let f = frns[(i * 7919) % frns.len()];
+        sim.write(f, i as u64);
+    }
+    let s = Instant::now();
+    ix.sync(&mut sim, &mut store, &table, &AtomicBool::new(false)).unwrap();
+    println!("apply 10,000 file changes (20,000 USN records) incl. commit: {:.1} ms, rescans={}", s.elapsed().as_secs_f64() * 1e3, ix.stats.rescans);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -277,6 +329,7 @@ fn main() {
         Some("kernels") => kernels(&args),
         Some("stages") => stages(&args),
         Some("floor") => floor(&args),
+        Some("index") => index_bench(&args),
         _ => eprintln!("usage: flint-bench engine|dump|kernels [options]"),
     }
 }
