@@ -111,6 +111,29 @@ impl VolumeIndex {
         v
     }
 
+    /// Rebuilds the FRN mapping for slots `base..base+n` just imported from a
+    /// snapshot. Fails (caller falls back to SQLite) unless exactly one root
+    /// with `root_frn` exists and every other slot has a parent.
+    pub fn adopt(t: &NameTable, volume: u16, root_frn: Frn, base: EntryId, n: usize) -> Result<Self, String> {
+        let mut root_id = None;
+        let mut v = VolumeIndex { volume, root_frn, root_id: NONE, by_segment: Vec::new(), extra_links: HashMap::new(), orphans: HashMap::new(), pending_rename: HashMap::new() };
+        for id in base..base + n as EntryId {
+            if t.parent(id) == NO_PARENT {
+                if t.key(id) != root_frn || root_id.is_some() {
+                    return Err(format!("unexpected parentless slot {id}"));
+                }
+                root_id = Some(id);
+            }
+            let seg = segment(t.key(id));
+            let primary = v.by_segment.get(seg as usize).is_none_or(|&p| p == NONE);
+            v.register(seg, id, primary);
+        }
+        v.root_id = root_id.ok_or("snapshot has no root")?;
+        let r = v.root_id;
+        v.register(segment(root_frn), r, true);
+        Ok(v)
+    }
+
     pub fn root(&self) -> EntryId {
         self.root_id
     }

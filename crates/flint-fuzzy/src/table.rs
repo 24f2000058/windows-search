@@ -332,6 +332,97 @@ impl NameTable {
         *self.dir_cache.lock().unwrap() = None;
     }
 
+    /// Copies one volume's live slots into a self-contained [`Chunk`] with
+    /// ids renumbered `0..n` (parents outside the chunk become `NO_PARENT`).
+    pub fn export_volume(&self, volume: u16) -> Chunk {
+        let ids: Vec<EntryId> = (0..self.len() as EntryId).filter(|&i| self.is_live(i) && self.volume[i as usize] == volume).collect();
+        let mut local = std::collections::HashMap::with_capacity(ids.len());
+        for (n, &id) in ids.iter().enumerate() {
+            local.insert(id, n as u32);
+        }
+        let mut c = Chunk { arena: Vec::new(), slots: Vec::with_capacity(ids.len()) };
+        for &id in &ids {
+            let i = id as usize;
+            let name_off = c.arena.len() as u32;
+            c.arena.extend_from_slice(self.name(id).as_bytes());
+            let folded_off = if self.folded_off[i] == self.name_off[i] {
+                name_off
+            } else {
+                let o = c.arena.len() as u32;
+                c.arena.extend_from_slice(self.folded(id).as_bytes());
+                o
+            };
+            c.slots.push(ChunkSlot {
+                name_off,
+                name_len: self.name_len[i],
+                folded_off,
+                folded_len: self.folded_len[i],
+                parent: local.get(&self.parent[i]).copied().unwrap_or(NO_PARENT),
+                size: self.size[i],
+                mtime: self.mtime[i],
+                flags: self.flags[i],
+                key: self.key[i],
+            });
+        }
+        c
+    }
+
+    /// Appends a chunk as `volume`, returning the id of its first slot.
+    /// Every span is bounds- and UTF-8-checked first (the table later reads
+    /// names without re-validation), so a corrupt chunk is rejected whole and
+    /// leaves the table untouched.
+    pub fn import_chunk(&mut self, volume: u16, c: &Chunk) -> Result<EntryId, ChunkError> {
+        let n = c.slots.len();
+        let base = self.len();
+        if base + n >= NO_PARENT as usize || self.arena.len() + c.arena.len() >= u32::MAX as usize {
+            return Err(ChunkError::TooLarge);
+        }
+        for (i, s) in c.slots.iter().enumerate() {
+            for (off, len) in [(s.name_off, s.name_len), (s.folded_off, s.folded_len)] {
+                let bytes = c.arena.get(off as usize..off as usize + len as usize).ok_or(ChunkError::BadSpan(i))?;
+                std::str::from_utf8(bytes).map_err(|_| ChunkError::BadUtf8(i))?;
+            }
+            if s.parent != NO_PARENT && s.parent as usize >= n {
+                return Err(ChunkError::BadParent(i));
+            }
+            if s.flags & flags::DEAD != 0 {
+                return Err(ChunkError::DeadSlot(i));
+            }
+        }
+        let abase = self.arena.len() as u32;
+        self.arena.extend_from_slice(&c.arena);
+        self.name_off.reserve(n);
+        self.name_len.reserve(n);
+        self.folded_off.reserve(n);
+        self.folded_len.reserve(n);
+        self.parent.reserve(n);
+        self.size.reserve(n);
+        self.mtime.reserve(n);
+        self.flags.reserve(n);
+        self.volume.reserve(n);
+        self.key.reserve(n);
+        self.mask.reserve(n);
+        for s in &c.slots {
+            self.name_off.push(abase + s.name_off);
+            self.name_len.push(s.name_len);
+            self.folded_off.push(abase + s.folded_off);
+            self.folded_len.push(s.folded_len);
+            self.parent.push(if s.parent == NO_PARENT { NO_PARENT } else { base as EntryId + s.parent });
+            self.size.push(s.size);
+            self.mtime.push(s.mtime);
+            self.flags.push(s.flags);
+            self.volume.push(volume);
+            self.key.push(s.key);
+            // Recomputed rather than trusted: a wrong mask would silently
+            // hide matches.
+            let m = mask_of(self.span(abase + s.folded_off, s.folded_len));
+            self.mask.push(m);
+        }
+        self.live += n;
+        self.touch(true);
+        Ok(base as EntryId)
+    }
+
     /// Approximate heap bytes used by the table.
     pub fn heap_bytes(&self) -> usize {
         self.arena.capacity()
@@ -344,6 +435,36 @@ impl NameTable {
     pub fn dead_bytes(&self) -> usize {
         self.dead_bytes
     }
+}
+
+/// One volume's slots in portable form (see [`NameTable::export_volume`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Chunk {
+    pub arena: Vec<u8>,
+    pub slots: Vec<ChunkSlot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkSlot {
+    pub name_off: u32,
+    pub name_len: u16,
+    pub folded_off: u32,
+    pub folded_len: u16,
+    /// Index within the chunk, or `NO_PARENT`.
+    pub parent: u32,
+    pub size: u64,
+    pub mtime: i64,
+    pub flags: u8,
+    pub key: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChunkError {
+    TooLarge,
+    BadSpan(usize),
+    BadUtf8(usize),
+    BadParent(usize),
+    DeadSlot(usize),
 }
 
 pub const NOT_DIR: u32 = u32::MAX;
@@ -411,6 +532,40 @@ mod tests {
         t.rename(a, b, "a");
         let _ = t.path(b);
         let _ = t.chain_masks();
+    }
+
+    #[test]
+    fn chunk_round_trip_and_rejection() {
+        let mut t = NameTable::new();
+        let other = t.push(NO_PARENT, "D:", Meta::dir(1));
+        let root = t.push_keyed(NO_PARENT, "C:", Meta::dir(0), 5);
+        let d = t.push_keyed(root, "Résumés", Meta::dir(0), 6);
+        let f = t.push_keyed(d, "CV.pdf", Meta::file(0, 9, 7), 7);
+        let gone = t.push_keyed(d, "old.txt", Meta::file(0, 1, 1), 8);
+        t.remove(gone);
+        t.push(other, "elsewhere.txt", Meta::file(1, 1, 1));
+        let c = t.export_volume(0);
+        assert_eq!(c.slots.len(), 3);
+        let mut u = NameTable::new();
+        u.push(NO_PARENT, "X:", Meta::dir(3));
+        let base = u.import_chunk(0, &c).unwrap();
+        let f2 = base + 2;
+        assert_eq!(u.path(f2), t.path(f));
+        assert_eq!(u.folded(f2), "cv.pdf");
+        assert_eq!(u.mask(f2), t.mask(f));
+        assert_eq!(u.meta(f2), t.meta(f));
+        assert_eq!(u.key(f2), 7);
+        let before = u.len();
+        let mut bad = c.clone();
+        bad.arena[0] = 0xff;
+        assert_eq!(u.import_chunk(0, &bad), Err(ChunkError::BadUtf8(0)));
+        let mut bad = c.clone();
+        bad.slots[1].parent = 99;
+        assert_eq!(u.import_chunk(0, &bad), Err(ChunkError::BadParent(1)));
+        let mut bad = c;
+        bad.slots[2].name_len = 9999;
+        assert_eq!(u.import_chunk(0, &bad), Err(ChunkError::BadSpan(2)));
+        assert_eq!(u.len(), before, "rejected chunks leave the table untouched");
     }
 
     #[test]

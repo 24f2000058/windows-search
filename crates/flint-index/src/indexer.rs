@@ -10,12 +10,14 @@
 //!   overwrite the stored checkpoint; they are reported as runtime status.
 
 use crate::model::*;
+use crate::snapshot;
 use crate::source::JournalSource;
 use crate::traverse::{Fs, TraversalReport, TraversalSource};
 use crate::store::{Store, StoreError};
 use crate::volume::{Changes, Followup, VolumeIndex};
 use flint_fuzzy::table::NameTable;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
@@ -68,12 +70,62 @@ pub struct VolumeIndexer {
     pub stats: Stats,
     /// Enumeration progress (links seen) while enumerating.
     pub progress: u64,
+    /// In-memory state is known to equal the committed store state (false
+    /// after a failed sync until the next successful one). Snapshots are only
+    /// written while true.
+    consistent: bool,
+}
+
+/// Where a volume's entries came from at startup.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoadSource {
+    Snapshot,
+    /// SQLite; `why` explains why no snapshot was used (None = none existed
+    /// or snapshots disabled).
+    Store { why: Option<String> },
 }
 
 impl VolumeIndexer {
     /// Loads a volume's persisted entries into `table`.
     pub fn open(store: &mut Store, table: &RwLock<NameTable>, volume: u16, key: &str, root_name: &str, root_frn: Frn) -> Result<Self, StoreError> {
+        Self::open_with_snapshot(store, table, volume, key, root_name, root_frn, None).map(|(ix, _)| ix)
+    }
+
+    /// Like [`open`](Self::open), but loads from a matching snapshot in
+    /// `snapshot_dir` when one exists (falling back to SQLite otherwise).
+    pub fn open_with_snapshot(store: &mut Store, table: &RwLock<NameTable>, volume: u16, key: &str, root_name: &str, root_frn: Frn, snapshot_dir: Option<&Path>) -> Result<(Self, LoadSource), StoreError> {
         let (db_id, state) = store.volume(key, root_name)?;
+        let mut why = None;
+        if let Some(dir) = snapshot_dir {
+            let path = snapshot::path_for(dir, key);
+            if path.exists() {
+                match snapshot::read(&path, key, store.commit_seq(db_id)?) {
+                    Ok(snap) if snap.root_frn == root_frn => {
+                        let mut t = table.write().unwrap();
+                        let n = snap.chunk.slots.len();
+                        match t.import_chunk(volume, &snap.chunk) {
+                            Ok(base) => match VolumeIndex::adopt(&t, volume, root_frn, base, n) {
+                                Ok(index) => {
+                                    drop(t);
+                                    let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats: Stats::default(), progress: 0, consistent: true };
+                                    return Ok((ix, LoadSource::Snapshot));
+                                }
+                                Err(e) => {
+                                    // Undo the import before falling back.
+                                    for id in base..base + n as u32 {
+                                        t.remove(id);
+                                    }
+                                    why = Some(format!("snapshot rejected: {e}"));
+                                }
+                            },
+                            Err(e) => why = Some(format!("snapshot rejected: {e:?}")),
+                        }
+                    }
+                    Ok(_) => why = Some("snapshot root mismatch".into()),
+                    Err(e) => why = Some(format!("{e:?}")),
+                }
+            }
+        }
         let mut t = table.write().unwrap();
         let mut index = VolumeIndex::new(&mut t, volume, root_frn, root_name);
         let mut ch = Changes::default();
@@ -82,7 +134,21 @@ impl VolumeIndexer {
         let mut stats = Stats::default();
         // A consistent store yields no orphans; any are repaired on sync.
         stats.inconsistencies += index.orphan_count() as u64;
-        Ok(VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: 0 })
+        let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: 0, consistent: true };
+        Ok((ix, LoadSource::Store { why }))
+    }
+
+    /// Writes a startup snapshot if the in-memory state provably mirrors the
+    /// committed store. Returns whether one was written.
+    pub fn write_snapshot(&self, store: &Store, table: &RwLock<NameTable>, dir: &Path) -> Result<bool, SyncError> {
+        if !self.consistent || self.index.orphan_count() > 0 {
+            return Ok(false);
+        }
+        let seq = store.commit_seq(self.db_id)?;
+        let chunk = table.read().unwrap().export_volume(self.index.volume);
+        let snap = snapshot::Snapshot { commit_seq: seq, root_frn: self.index.root_frn, key: self.key.clone(), chunk };
+        snapshot::write(&snapshot::path_for(dir, &self.key), &snap).map_err(|e| SyncError::Source(SourceError::Io(e.to_string())))?;
+        Ok(true)
     }
 
     /// True only if the volume is journal-current with no transient problem.
@@ -99,6 +165,7 @@ impl VolumeIndexer {
     /// Brings the volume up to date. Safe to call repeatedly.
     pub fn sync(&mut self, src: &mut dyn JournalSource, store: &mut Store, table: &RwLock<NameTable>, cancel: &AtomicBool) -> Result<(), SyncError> {
         let r = self.sync_inner(src, store, table, cancel);
+        self.consistent = r.is_ok();
         match &r {
             Ok(()) => {
                 self.runtime = None;
@@ -215,6 +282,7 @@ impl VolumeIndexer {
         self.persist_state(store, true, VolumeState::Traversal { complete: false, skipped: 0 })?;
         let r = self.enumerate_into(src, store, table, cancel);
         let report = src.report.clone();
+        self.consistent = r.is_ok();
         if let Err(e) = r {
             self.runtime = Some(format!("{e:?}"));
             return Err(e);

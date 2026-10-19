@@ -15,7 +15,7 @@ use crate::volume::StoreOp;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -135,7 +135,12 @@ impl Store {
         if v < 1 {
             tx.execute_batch(SCHEMA_V1)?;
         }
-        // Future migrations: `if v < 2 { ... }`, each idempotent.
+        if v < 2 {
+            // v2: per-volume commit counter, so snapshots can prove they
+            // mirror exactly the committed state.
+            tx.execute_batch("ALTER TABLE volumes ADD COLUMN commit_seq INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        // Future migrations: `if v < 3 { ... }`.
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(if v == 0 { OpenOutcome::Created } else { OpenOutcome::Migrated { from: v } })
@@ -200,6 +205,7 @@ impl Store {
             let (k, a, b, d) = st.encode();
             tx.execute("UPDATE volumes SET state = ?2, a = ?3, b = ?4, detail = ?5 WHERE id = ?1", params![vol, k, a, b, d])?;
         }
+        tx.execute("UPDATE volumes SET commit_seq = commit_seq + 1 WHERE id = ?1", [vol])?;
         tx.commit()?;
         Ok(())
     }
@@ -215,6 +221,11 @@ impl Store {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// Number of committed transactions for a volume (monotonic).
+    pub fn commit_seq(&self, vol: i64) -> Result<u64> {
+        Ok(self.conn.query_row("SELECT commit_seq FROM volumes WHERE id = ?1", [vol], |r| r.get::<_, i64>(0))? as u64)
     }
 
     pub fn entry_count(&self, vol: i64) -> Result<i64> {
@@ -253,6 +264,26 @@ mod tests {
         drop(s);
         assert!(matches!(Store::open(&p), Err(StoreError::NewerSchema(99))));
         assert!(p.exists(), "a newer database must not be moved or destroyed");
+    }
+
+    #[test]
+    fn migrates_v1_database_in_place() {
+        let p = tmp("migrate");
+        let _ = std::fs::remove_file(&p);
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute("INSERT INTO volumes (key, root_name, state) VALUES ('k', 'C:', 'not_indexed')", []).unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let (mut s, o) = Store::open(&p).unwrap();
+        assert_eq!(o, OpenOutcome::Migrated { from: 1 });
+        let (v, _) = s.volume("k", "C:").unwrap();
+        assert_eq!(s.commit_seq(v).unwrap(), 0);
+        s.commit(v, false, &[], None).unwrap();
+        assert_eq!(s.commit_seq(v).unwrap(), 1);
+        drop(s);
+        assert_eq!(Store::open(&p).unwrap().1, OpenOutcome::Opened);
     }
 
     #[test]

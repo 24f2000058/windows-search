@@ -4,6 +4,7 @@
 pub mod indexer;
 pub mod model;
 pub mod sim;
+pub mod snapshot;
 pub mod source;
 pub mod store;
 pub mod traverse;

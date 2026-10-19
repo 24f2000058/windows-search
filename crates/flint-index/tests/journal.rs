@@ -443,3 +443,74 @@ fn traversal_volume_persists_honest_coverage() {
     assert!(!ix.state.is_complete(), "restart must not see partial traversal as complete");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn snapshot_is_used_only_when_it_matches_the_store() {
+    use flint_index::indexer::LoadSource;
+    let mut r = Rng(12);
+    let mut sim = SimVolume::new();
+    populate(&mut sim, &mut r, 2000);
+    let db = db_path("snapshot");
+    let snaps = db.parent().unwrap().join("snapshots");
+    let open = |sim: &SimVolume| {
+        let (mut store, _) = Store::open(&db).unwrap();
+        let table = RwLock::new(NameTable::new());
+        let (ix, src) = VolumeIndexer::open_with_snapshot(&mut store, &table, 0, KEY, "C:", sim.root, Some(&snaps)).unwrap();
+        (App { table, store, ix }, src)
+    };
+    let (mut app, src) = open(&sim);
+    assert_eq!(src, LoadSource::Store { why: None });
+    app.sync(&mut sim).unwrap();
+    assert!(app.ix.write_snapshot(&app.store, &app.table, &snaps).unwrap());
+    drop(app);
+
+    // Fresh start: snapshot matches the store.
+    let (mut app, src) = open(&sim);
+    assert_eq!(src, LoadSource::Snapshot);
+    app.assert_matches(&sim, "loaded from snapshot");
+    // Journal application still works on snapshot-loaded data.
+    for _ in 0..100 {
+        random_op(&mut sim, &mut r);
+    }
+    app.sync(&mut sim).unwrap();
+    app.assert_matches(&sim, "synced after snapshot load");
+    assert_eq!(app.ix.stats.rescans, 0);
+    drop(app);
+
+    // The store moved on without a new snapshot: stale, fall back.
+    let (app, src) = open(&sim);
+    assert!(matches!(src, LoadSource::Store { why: Some(ref w) } if w.contains("Stale")), "{src:?}");
+    app.assert_matches(&sim, "stale snapshot ignored");
+    app.ix.write_snapshot(&app.store, &app.table, &snaps).unwrap();
+    drop(app);
+
+    // Corruption: fall back, never trust it.
+    let p = flint_index::snapshot::path_for(&snaps, KEY);
+    let mut bytes = std::fs::read(&p).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x55;
+    std::fs::write(&p, &bytes).unwrap();
+    let (app, src) = open(&sim);
+    assert!(matches!(src, LoadSource::Store { why: Some(ref w) } if w.contains("Checksum")), "{src:?}");
+    app.assert_matches(&sim, "corrupt snapshot ignored");
+}
+
+#[test]
+fn snapshot_not_written_after_failed_sync() {
+    let mut r = Rng(13);
+    let mut sim = SimVolume::new();
+    populate(&mut sim, &mut r, 300);
+    let db = db_path("snapshot-fail");
+    let snaps = db.parent().unwrap().join("snapshots");
+    let mut app = App::start(&db, &sim);
+    app.sync(&mut sim).unwrap();
+    for _ in 0..50 {
+        random_op(&mut sim, &mut r);
+    }
+    app.store.fail_after_ops = Some(3);
+    assert!(app.sync(&mut sim).is_err());
+    app.store.fail_after_ops = None;
+    assert!(!app.ix.write_snapshot(&app.store, &app.table, &snaps).unwrap(), "memory may be ahead of the store");
+    app.sync(&mut sim).unwrap();
+    assert!(app.ix.write_snapshot(&app.store, &app.table, &snaps).unwrap());
+}

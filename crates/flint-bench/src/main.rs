@@ -310,6 +310,43 @@ fn index_bench(args: &[String]) {
     let table = RwLock::new(NameTable::new());
     let mut ix = VolumeIndexer::open(&mut store, &table, 0, "bench", "C:", sim.root).unwrap();
     println!("restart load from SQLite: {:.2}s ({} slots), RSS +{:.1} MB", s.elapsed().as_secs_f64(), table.read().unwrap().live_count(), (rss_kb() - rss0) as f64 / 1024.0);
+    {
+        // Breakdown: SQLite read alone vs rebuilding the in-memory index.
+        let (st, _) = Store::open(&db).unwrap();
+        let s = Instant::now();
+        let mut recs = Vec::new();
+        st.load(1, |r| recs.push(r)).unwrap();
+        let read = s.elapsed();
+        let s = Instant::now();
+        let mut t = NameTable::new();
+        let mut v = flint_index::volume::VolumeIndex::new(&mut t, 0, sim.root, "C:");
+        let mut ch = flint_index::volume::Changes::default();
+        for r in &recs {
+            v.apply_record(&mut t, r, &mut ch);
+        }
+        println!("  breakdown: SQLite read {:.2}s, index rebuild {:.2}s", read.as_secs_f64(), s.elapsed().as_secs_f64());
+    }
+    {
+        let snaps = dir.join("snapshots");
+        let s = Instant::now();
+        assert!(ix.write_snapshot(&store, &table, &snaps).unwrap());
+        let write = s.elapsed();
+        let snap_bytes = std::fs::metadata(flint_index::snapshot::path_for(&snaps, "bench")).unwrap().len();
+        let s = Instant::now();
+        drop(Store::open(&db).unwrap());
+        println!("  Store::open alone: {:.3}s", s.elapsed().as_secs_f64());
+        let s = Instant::now();
+        let (mut st2, _) = Store::open(&db).unwrap();
+        let t2 = RwLock::new(NameTable::new());
+        let (_, src) = VolumeIndexer::open_with_snapshot(&mut st2, &t2, 0, "bench", "C:", sim.root, Some(&snaps)).unwrap();
+        println!(
+            "snapshot: write {:.2}s, {:.1} MB; restart load {:.3}s via {src:?} ({} slots)",
+            write.as_secs_f64(),
+            snap_bytes as f64 / 1e6,
+            s.elapsed().as_secs_f64(),
+            t2.read().unwrap().live_count()
+        );
+    }
     let frns = sim.frns();
     for i in 0..10_000 {
         let f = frns[(i * 7919) % frns.len()];
