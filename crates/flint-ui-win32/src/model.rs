@@ -47,13 +47,8 @@ impl ResultsModel {
     }
 }
 
-/// Index coverage summary supplied by the indexer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Coverage {
-    pub complete: bool,
-    /// e.g. "D: indexing 43%", "\\\\nas\\share unavailable".
-    pub problems: Vec<String>,
-}
+/// Index coverage summary supplied by the catalog.
+pub use flint_index::catalog::Coverage;
 
 /// One-line status that never conflates "nothing matched" with "we did not
 /// look everywhere".
@@ -68,7 +63,14 @@ pub fn status_line(s: &Status, shown: usize, cov: &Coverage) -> String {
     }
     if !matches!(s.stop, Stop::Canceled | Stop::Unsupported) {
         if s.total_matched == 0 {
-            parts.push(if s.indexed_exhausted { "no indexed candidates".into() } else { "no matches".into() });
+            parts.push(if cov.loading {
+                // Never say "no matches" while part of the index is not loaded.
+                "no matches yet — index still loading".into()
+            } else if s.indexed_exhausted {
+                "no indexed candidates".into()
+            } else {
+                "no matches".into()
+            });
         } else if s.total_matched > shown {
             parts.push(format!("{shown} of {} matches", s.total_matched));
         } else {
@@ -164,8 +166,10 @@ mod tests {
     fn status_distinguishes_no_match_from_incomplete_index() {
         let t = table();
         let r = run(&t, "zzzzqqq", &Options { best_effort: false, ..Default::default() });
-        let complete = Coverage { complete: true, problems: vec![] };
-        let partial = Coverage { complete: false, problems: vec!["D: indexing 40%".into()] };
+        let complete = Coverage { complete: true, loading: false, problems: vec![] };
+        let partial = Coverage { complete: false, loading: false, problems: vec!["D: indexing 40%".into()] };
+        let loading = Coverage { complete: false, loading: true, problems: vec!["C: loading index".into()] };
+        assert!(status_line(&r.status, 0, &loading).starts_with("no matches yet — index still loading"));
         assert!(status_line(&r.status, 0, &complete).starts_with("no matches"));
         let s = status_line(&r.status, 0, &partial);
         assert!(s.contains("no matches") && s.contains("index incomplete: D: indexing 40%"), "{s}");
@@ -178,5 +182,87 @@ mod tests {
         assert!(status_line(&canceled.status, 0, &complete).starts_with("search canceled"));
         let unsupported = run(&t, "content:x", &Options::default());
         assert!(status_line(&unsupported.status, 0, &complete).contains("not available yet: content:x"));
+    }
+}
+
+/// UI colors as Win32 COLORREF (0x00BBGGRR).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    pub bg: u32,
+    pub edit_bg: u32,
+    pub text: u32,
+    pub dim: u32,
+    pub sel_bg: u32,
+    pub sel_text: u32,
+    pub accent: u32,
+}
+
+pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32) | (g as u32) << 8 | (b as u32) << 16
+}
+
+pub fn palette(dark: bool) -> Palette {
+    if dark {
+        Palette { bg: rgb(32, 32, 32), edit_bg: rgb(43, 43, 43), text: rgb(232, 232, 232), dim: rgb(160, 160, 160), sel_bg: rgb(31, 58, 90), sel_text: rgb(255, 255, 255), accent: rgb(110, 185, 255) }
+    } else {
+        Palette { bg: rgb(255, 255, 255), edit_bg: rgb(255, 255, 255), text: rgb(32, 32, 32), dim: rgb(105, 105, 105), sel_bg: rgb(204, 227, 245), sel_text: rgb(0, 0, 0), accent: rgb(0, 90, 192) }
+    }
+}
+
+/// WCAG relative-luminance contrast ratio between two COLORREFs.
+#[cfg_attr(not(test), allow(dead_code))] // used by the palette tests
+pub fn contrast(a: u32, b: u32) -> f64 {
+    let lum = |c: u32| {
+        let ch = |v: u32| {
+            let s = v as f64 / 255.0;
+            if s <= 0.039_28 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * ch(c & 0xFF) + 0.7152 * ch((c >> 8) & 0xFF) + 0.0722 * ch((c >> 16) & 0xFF)
+    };
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    #[test]
+    fn palettes_meet_wcag_aa_text_contrast() {
+        for dark in [false, true] {
+            let p = palette(dark);
+            for (fg, bg, what) in [(p.text, p.bg, "text"), (p.text, p.edit_bg, "edit"), (p.sel_text, p.sel_bg, "selection"), (p.accent, p.bg, "highlight"), (p.dim, p.bg, "status")] {
+                let c = contrast(fg, bg);
+                assert!(c >= 4.5, "dark={dark} {what}: {c:.2}:1 is below 4.5:1");
+            }
+        }
+    }
+}
+
+/// Search options from the user's settings.
+pub fn search_options(c: &flint_config::Search) -> flint_fuzzy::engine::Options {
+    use flint_config::FuzzyIntensity as F;
+    use flint_fuzzy::engine::Intensity as I;
+    flint_fuzzy::engine::Options {
+        limit: c.result_limit,
+        intensity: match c.fuzzy_intensity {
+            F::Off => I::Off,
+            F::Low => I::Low,
+            F::Normal => I::Normal,
+            F::Aggressive => I::Aggressive,
+        },
+        enough: c.enough,
+        best_effort: c.best_effort,
+        exhaustive: c.exhaustive_fallback,
+        through: None,
+        deadline: (c.deadline_ms > 0).then(|| std::time::Duration::from_millis(c.deadline_ms)),
+    }
+}
+
+#[cfg(test)]
+mod options_tests {
+    #[test]
+    fn defaults_match_engine_defaults() {
+        assert_eq!(super::search_options(&flint_config::Search::default()), flint_fuzzy::engine::Options::default());
     }
 }

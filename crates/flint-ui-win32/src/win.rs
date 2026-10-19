@@ -10,19 +10,23 @@
 //! * hotkey -> window painted and focused
 //! * keystroke -> final results painted
 //!
-//! Known spike limitations (tracked in docs/requirements.md): no file icons,
-//! no theming or settings UI, comctl32 v6 manifest not embedded, Enter only
-//! reveals in Explorer.
+//! Indexing runs in a [`Catalog`] (one worker per volume); settings come from
+//! the versioned config in the data directory (installed or portable).
+//!
+//! Known limitations (tracked in docs/requirements.md): no settings window
+//! (edit config.toml), comctl32 v6 manifest not embedded, Enter only reveals
+//! in Explorer, file-type icons only.
 
-use crate::model::{status_line, Coverage, LatencyStats, ResultsModel};
+use crate::icons::Icons;
+use crate::model::{search_options, status_line, Coverage, LatencyStats, Palette, ResultsModel};
+use flint_config::Theme;
+use flint_index::catalog::{Catalog, CatalogOptions};
 use flint_commands::{websearch, Action, Registry};
-use flint_fuzzy::engine::{highlight, Intensity, Options};
+use flint_fuzzy::engine::{highlight, Options};
+use flint_fuzzy::table::flags;
 use flint_fuzzy::query::parse;
 use flint_fuzzy::session::{Event, Session};
 use flint_fuzzy::table::{Meta, NameTable, NO_PARENT};
-use flint_index::model::FileRecord;
-use flint_index::traverse::{RealFs, TraversalSource};
-use flint_index::volume::{Changes, VolumeIndex};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::ptr::{null, null_mut};
@@ -45,6 +49,8 @@ const ID_EDIT: isize = 100;
 const ID_LIST: isize = 101;
 const HOTKEY_ID: i32 = 1;
 const SELFTEST_TIMER: usize = 7;
+/// Coalesce index-change repaints.
+static INDEX_REPAINT_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -83,6 +89,54 @@ struct State {
     /// `--selftest`: queries typed programmatically, one per timer tick.
     selftest: Vec<String>,
     selftest_pos: Cell<usize>,
+    /// None in `--synthetic` mode.
+    catalog: Option<Arc<Catalog>>,
+    indexing: flint_config::Indexing,
+    only_root: Option<String>,
+    opts: Options,
+    theme: Theme,
+    palette: Cell<Palette>,
+    /// (window background, edit background)
+    brushes: Cell<(HBRUSH, HBRUSH)>,
+    icons: RefCell<Icons>,
+    /// Config/indexing messages shown until the user types.
+    notice: RefCell<String>,
+}
+
+fn coverage(s: &State) -> Coverage {
+    match &s.catalog {
+        Some(c) => c.coverage(),
+        None => s.coverage.lock().unwrap().clone(),
+    }
+}
+
+fn apply_palette(s: &State) {
+    let p = crate::theme::current(s.theme);
+    s.palette.set(p);
+    let (old_bg, old_edit) = s.brushes.get();
+    unsafe {
+        s.brushes.set((CreateSolidBrush(p.bg), CreateSolidBrush(p.edit_bg)));
+        if !old_bg.is_null() {
+            DeleteObject(old_bg);
+            DeleteObject(old_edit);
+        }
+        SendMessageW(s.list, LVM_SETBKCOLOR, 0, p.bg as LPARAM);
+        InvalidateRect(s.hwnd, null(), 1);
+        InvalidateRect(s.edit, null(), 1);
+        InvalidateRect(s.list, null(), 1);
+    }
+}
+
+/// Re-plans volumes off the UI thread (startup, device arrival/removal).
+fn resync_volumes(s: &State) {
+    if let Some(cat) = s.catalog.clone() {
+        let (cfg, root) = (s.indexing.clone(), s.only_root.clone());
+        std::thread::spawn(move || {
+            for n in crate::volumes::sync(&cat, &cfg, root.as_deref()) {
+                println!("volumes: {n}");
+            }
+        });
+    }
 }
 
 thread_local! {
@@ -166,19 +220,20 @@ fn submit(s: &State) {
     let text = String::from_utf16_lossy(&buf[..n]);
     let cmds = s.commands.evaluate(&text);
     *s.command_line.borrow_mut() = cmds.first().map(|c| format!("{}  —  {}", c.title, c.subtitle)).unwrap_or_default();
+    s.notice.borrow_mut().clear();
     *s.query_text.borrow_mut() = text.clone();
     if cmds.first().is_some_and(|c| c.exclusive) {
         // `/s` claims the input; no file search runs for it.
         *s.model.borrow_mut() = ResultsModel::default();
         // Advance the generation so an in-flight file search is canceled and
         // its late results are rejected as stale.
-        let g = s.session.submit("", Options::default());
+        let g = s.session.submit("", s.opts.clone());
         s.latest.store(g, Ordering::SeqCst);
         set_count(s);
         unsafe { InvalidateRect(s.hwnd, null(), 1) };
         return;
     }
-    let generation = s.session.submit(&text, Options::default());
+    let generation = s.session.submit(&text, s.opts.clone());
     s.latest.store(generation, Ordering::SeqCst);
     s.t_key.set(Some((generation, qpc())));
 }
@@ -256,8 +311,9 @@ fn activate_selected(s: &State) {
 /// Draws `text` with the chars at `hl` (char indices) in bold accent color.
 unsafe fn draw_highlighted(hdc: HDC, s: &State, rc: &RECT, text: &str, hl: &[usize], selected: bool) {
     let (font, bold) = s.fonts.get();
-    let normal = if selected { GetSysColor(COLOR_HIGHLIGHTTEXT) } else { GetSysColor(COLOR_WINDOWTEXT) };
-    let accent = if selected { normal } else { 0x00C0_5A00 }; // BGR: blue-ish accent
+    let p = s.palette.get();
+    let normal = if selected { p.sel_text } else { p.text };
+    let accent = if selected { normal } else { p.accent };
     SetBkMode(hdc, TRANSPARENT as i32);
     let mut x = rc.left + scale(4, s.dpi.get());
     let chars: Vec<char> = text.chars().collect();
@@ -301,18 +357,29 @@ unsafe fn on_custom_draw(s: &State, cd: &mut NMLVCUSTOMDRAW) -> LRESULT {
             if cd.iSubItem == 0 {
                 rc.right = rc.left + SendMessageW(s.list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
             }
-            let bg = CreateSolidBrush(if selected { GetSysColor(COLOR_HIGHLIGHT) } else { GetSysColor(COLOR_WINDOW) });
+            let p = s.palette.get();
+            let bg = CreateSolidBrush(if selected { p.sel_bg } else { p.bg });
             FillRect(cd.nmcd.hdc, &rc, bg);
             DeleteObject(bg);
-            let (text, hl) = {
+            let (text, hl, is_dir) = {
                 let t = s.table.read().unwrap();
                 if !t.is_live(hit.id) {
                     return CDRF_SKIPDEFAULT as LRESULT;
                 }
                 let q = parse(&s.query_text.borrow(), 0);
-                let h = highlight(&t, &q, Intensity::Normal, &hit);
-                if cd.iSubItem == 0 { (t.name(hit.id).to_owned(), h.name) } else { (t.parent_path(hit.id), h.dir) }
+                let h = highlight(&t, &q, s.opts.intensity, &hit);
+                let is_dir = t.flags(hit.id) & flags::DIR != 0;
+                if cd.iSubItem == 0 { (t.name(hit.id).to_owned(), h.name, is_dir) } else { (t.parent_path(hit.id), h.dir, is_dir) }
             };
+            if cd.iSubItem == 0 {
+                let icon = s.icons.borrow_mut().index(&text, is_dir);
+                let size = GetSystemMetrics(SM_CXSMICON);
+                if let Some(i) = icon {
+                    let list = s.icons.borrow().list;
+                    ImageList_Draw(list, i, cd.nmcd.hdc, rc.left + scale(4, s.dpi.get()), rc.top + (rc.bottom - rc.top - size) / 2, ILD_TRANSPARENT);
+                }
+                rc.left += size + scale(6, s.dpi.get());
+            }
             draw_highlighted(cd.nmcd.hdc, s, &rc, &text, &hl, selected);
             CDRF_SKIPDEFAULT as LRESULT
         }
@@ -441,7 +508,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             GetClientRect(hwnd, &mut rc);
             rc.top = rc.bottom - scale(26, s.dpi.get());
             rc.left += scale(10, s.dpi.get());
-            let cov = s.coverage.lock().unwrap().clone();
+            let cov = coverage(s);
             let mut line = {
                 let m = s.model.borrow();
                 m.status.as_ref().map(|st| status_line(st, m.hits.len(), &cov)).unwrap_or_else(|| status_line_idle(&cov))
@@ -450,15 +517,19 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             if !cmd.is_empty() {
                 line = format!("{cmd}   |   {line}");
             }
+            let notice = s.notice.borrow().clone();
+            if !notice.is_empty() {
+                line = format!("{notice}   |   {line}");
+            }
             let w = wide(&line);
             // Erase first: text is drawn transparently and repaints are not
             // always preceded by WM_ERASEBKGND.
             let mut bg_rc = rc;
             bg_rc.left = 0;
-            FillRect(hdc, &bg_rc, (COLOR_WINDOW + 1) as usize as HBRUSH);
+            FillRect(hdc, &bg_rc, s.brushes.get().0);
             SelectObject(hdc, s.fonts.get().0);
             SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
+            SetTextColor(hdc, s.palette.get().dim);
             DrawTextW(hdc, w.as_ptr(), w.len() as i32 - 1, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
             EndPaint(hwnd, &ps);
             0
@@ -501,8 +572,37 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             0
         }
         WM_APP_INDEX => {
-            InvalidateRect(hwnd, null(), 1);
+            INDEX_REPAINT_PENDING.store(false, Ordering::SeqCst);
+            // Repaint only the status strip; results refresh on next query.
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            rc.top = rc.bottom - scale(26, s.dpi.get());
+            InvalidateRect(hwnd, &rc, 0);
             0
+        }
+        WM_ERASEBKGND => {
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            FillRect(wp as HDC, &rc, s.brushes.get().0);
+            1
+        }
+        WM_CTLCOLOREDIT => {
+            let p = s.palette.get();
+            SetTextColor(wp as HDC, p.text);
+            SetBkColor(wp as HDC, p.edit_bg);
+            s.brushes.get().1 as LRESULT
+        }
+        WM_SETTINGCHANGE => {
+            // Theme switches arrive as "ImmersiveColorSet"; high contrast via
+            // SPI_SETHIGHCONTRAST. Re-evaluating is cheap, so do it on any.
+            apply_palette(s);
+            0
+        }
+        WM_DEVICECHANGE => {
+            if matches!(wp as u32, DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE) {
+                resync_volumes(s);
+            }
+            1
         }
         WM_DPICHANGED => {
             s.dpi.set((wp & 0xFFFF) as u32);
@@ -520,6 +620,11 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             0
         }
         WM_DESTROY => {
+            if let Some(c) = &s.catalog {
+                for v in c.statuses() {
+                    println!("volume {}: {:?}, loaded via {:?}, stale meta {}, rescans {}", v.root_name, v.phase, v.load_source, v.stale_meta, v.stats.rescans);
+                }
+            }
             for (label, st) in [("hotkey -> painted", &s.hotkey_stats), ("keystroke -> results painted", &s.key_stats)] {
                 if let Some((n, p50, p95, max)) = st.borrow().summary() {
                     println!("{label}: n={n} p50={p50:.2} ms p95={p95:.2} ms max={max:.2} ms");
@@ -536,68 +641,28 @@ fn status_line_idle(cov: &Coverage) -> String {
     if cov.complete { "type to search".into() } else { format!("type to search · indexing: {}", cov.problems.join(", ")) }
 }
 
-/// Background indexing for the spike: traversal of `root` (no persistence),
-/// or a synthetic corpus. Batches take the table write lock briefly so
-/// searches keep running.
-fn spawn_indexer(table: Arc<RwLock<NameTable>>, coverage: Arc<Mutex<Coverage>>, hwnd_bits: usize, root: Option<String>, synthetic: Option<usize>) {
+/// `--synthetic N`: an in-memory corpus for UI benchmarking (no catalog).
+fn spawn_synthetic(table: Arc<RwLock<NameTable>>, coverage: Arc<Mutex<Coverage>>, hwnd_bits: usize, n: usize) {
     std::thread::spawn(move || {
-        let notify = || unsafe {
-            PostMessageW(hwnd_bits as HWND, WM_APP_INDEX, 0, 0);
-        };
-        if let Some(n) = synthetic {
-            let mut t = table.write().unwrap();
-            let r = t.push(NO_PARENT, "S:", Meta::dir(9));
-            let words = ["report", "invoice", "notes", "project", "photo", "budget", "draft", "final", "main", "index"];
-            let mut dirs = vec![r];
-            let mut x = 0x9E37_79B9u64;
-            for i in 0..n {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                let parent = dirs[(x as usize) % dirs.len()];
-                if i % 10 == 0 {
-                    dirs.push(t.push(parent, &format!("{}_{}", words[(x >> 8) as usize % 10], i), Meta::dir(9)));
-                } else {
-                    t.push(parent, &format!("{}-{}_{}.txt", words[(x >> 8) as usize % 10], words[(x >> 16) as usize % 10], i), Meta::file(9, i as u64, 1_700_000_000));
-                }
+        let mut t = table.write().unwrap();
+        let r = t.push(NO_PARENT, "S:", Meta::dir(9));
+        let words = ["report", "invoice", "notes", "project", "photo", "budget", "draft", "final", "main", "index"];
+        let mut dirs = vec![r];
+        let mut x = 0x9E37_79B9u64;
+        for i in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let parent = dirs[(x as usize) % dirs.len()];
+            if i % 10 == 0 {
+                dirs.push(t.push(parent, &format!("{}_{}", words[(x >> 8) as usize % 10], i), Meta::dir(9)));
+            } else {
+                t.push(parent, &format!("{}-{}_{}.txt", words[(x >> 8) as usize % 10], words[(x >> 16) as usize % 10], i), Meta::file(9, i as u64, 1_700_000_000));
             }
-            *coverage.lock().unwrap() = Coverage { complete: true, problems: vec![] };
-            drop(t);
-            notify();
-            return;
         }
-        let root = root.unwrap_or_else(|| std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into()));
-        let label = root.trim_end_matches('\\').to_owned();
-        *coverage.lock().unwrap() = Coverage { complete: false, problems: vec![format!("{label} indexing")] };
-        let mut src = TraversalSource::new(root.clone().into(), RealFs);
-        let mut vol = VolumeIndex::new(&mut table.write().unwrap(), 1, src.root_frn, &label);
-        let mut batch: Vec<FileRecord> = Vec::new();
-        let mut ch = Changes::default();
-        let mut flush = |batch: &mut Vec<FileRecord>, vol: &mut VolumeIndex| {
-            let mut t = table.write().unwrap();
-            for r in batch.drain(..) {
-                vol.apply_record(&mut t, &r, &mut ch);
-            }
-            ch.ops.clear();
-            ch.followups.clear();
-        };
-        src.walk(&mut |r| {
-            batch.push(r);
-            if batch.len() >= 10_000 {
-                flush(&mut batch, &mut vol);
-                notify();
-            }
-            true
-        });
-        flush(&mut batch, &mut vol);
-        let rep = src.report.clone();
-        *coverage.lock().unwrap() = if rep.complete() {
-            Coverage { complete: true, problems: vec![] }
-        } else {
-            Coverage { complete: false, problems: vec![format!("{label}: {} folders unreadable", rep.skipped.len())] }
-        };
-        println!("indexed {} entries under {root} ({} unreadable folders, {} links not followed)", rep.entries, rep.skipped.len(), rep.links_not_followed);
-        notify();
+        *coverage.lock().unwrap() = Coverage { complete: true, loading: false, problems: vec![] };
+        drop(t);
+        unsafe { PostMessageW(hwnd_bits as HWND, WM_APP_INDEX, 0, 0) };
     });
 }
 
@@ -608,7 +673,25 @@ pub fn run() {
     let flag_value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let selftest: Vec<String> = flag_value("--selftest").map(|v| v.split('|').map(str::to_owned).collect()).unwrap_or_default();
     let show_now = args.iter().any(|a| a == "--show") || !selftest.is_empty();
-    let root = args.iter().skip(1).filter(|a| !a.starts_with("--")).find(|a| Some(*a) != flag_value("--synthetic").as_ref() && Some(*a) != flag_value("--selftest").as_ref()).cloned();
+    // `--root PATH` (or a bare path) indexes only that folder.
+    let root = flag_value("--root").or_else(|| args.iter().skip(1).filter(|a| !a.starts_with("--")).find(|a| Some(*a) != flag_value("--synthetic").as_ref() && Some(*a) != flag_value("--selftest").as_ref()).cloned());
+
+    // Settings and data locations (installed: %LOCALAPPDATA%\Flint; portable:
+    // <exe dir>\data when portable.marker exists).
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| ".".into());
+    let lad = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    let paths = match flint_config::resolve_paths(&exe_dir, lad.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot determine data directory: {e}");
+            return;
+        }
+    };
+    let _ = std::fs::create_dir_all(&paths.data_dir);
+    let loaded = flint_config::load(&paths.config);
+    let cfg = loaded.config;
+    let mut notices: Vec<String> = loaded.notes.iter().filter(|n| !matches!(n, flint_config::Note::Created)).map(|n| format!("settings: {n:?}")).collect();
+    println!("data dir: {} (portable: {}), config notes: {:?}", paths.data_dir.display(), paths.portable, loaded.notes);
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES };
@@ -624,7 +707,8 @@ pub fn run() {
             hInstance: hinst,
             hIcon: null_mut(),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_WINDOW + 1) as usize as HBRUSH,
+            // Painted in WM_ERASEBKGND with the theme palette.
+            hbrBackground: null_mut(),
             lpszMenuName: null(),
             lpszClassName: class.as_ptr(),
             hIconSm: null_mut(),
@@ -651,14 +735,34 @@ pub fn run() {
         let table = Arc::new(RwLock::new(NameTable::new()));
         let latest = Arc::new(AtomicU64::new(0));
         let hwnd_bits = hwnd as usize;
-        let session = Session::new(table.clone(), Duration::from_millis(8), move |ev: Event| {
+        let session = Session::new(table.clone(), Duration::from_millis(cfg.search.debounce_ms), move |ev: Event| {
             let p = Box::into_raw(Box::new(ev));
             if PostMessageW(hwnd_bits as HWND, WM_APP_EVENT, 0, p as LPARAM) == 0 {
                 drop(Box::from_raw(p));
             }
         });
         let coverage = Arc::new(Mutex::new(Coverage::default()));
-        spawn_indexer(table.clone(), coverage.clone(), hwnd_bits, root, synthetic);
+        let catalog = match synthetic {
+            Some(n) => {
+                spawn_synthetic(table.clone(), coverage.clone(), hwnd_bits, n);
+                None
+            }
+            None => {
+                let on_change: flint_index::catalog::OnChange = Arc::new(move || {
+                    if !INDEX_REPAINT_PENDING.swap(true, Ordering::SeqCst) {
+                        PostMessageW(hwnd_bits as HWND, WM_APP_INDEX, 0, 0);
+                    }
+                });
+                let meta = CatalogOptions { meta_batch: cfg.indexing.metadata_refresh_per_second as usize, ..CatalogOptions::default() };
+                match Catalog::new(table.clone(), paths.index_db.clone(), Some(paths.snapshots.clone()), meta, on_change) {
+                    Ok(c) => Some(Arc::new(c)),
+                    Err(e) => {
+                        notices.push(format!("index database unavailable: {e}"));
+                        None
+                    }
+                }
+            }
+        };
         let (font, bold) = make_fonts(dpi);
         let mut freq = 0i64;
         QueryPerformanceFrequency(&mut freq);
@@ -670,7 +774,7 @@ pub fn run() {
             session,
             latest,
             coverage,
-            commands: Registry::with_builtins(websearch::Provider::duckduckgo()),
+            commands: Registry::with_builtins(websearch::Provider { name: cfg.web_search.provider.clone(), template: cfg.web_search.template.clone() }),
             freq: freq as f64,
             model: RefCell::new(ResultsModel::default()),
             query_text: RefCell::new(String::new()),
@@ -684,21 +788,31 @@ pub fn run() {
             disp_buf: RefCell::new(Vec::new()),
             selftest: selftest.clone(),
             selftest_pos: Cell::new(0),
+            catalog,
+            indexing: cfg.indexing.clone(),
+            only_root: root,
+            opts: search_options(&cfg.search),
+            theme: cfg.general.theme,
+            palette: Cell::new(crate::model::palette(false)),
+            brushes: Cell::new((null_mut(), null_mut())),
+            icons: RefCell::new(Icons::new()),
+            notice: RefCell::new(String::new()),
         });
         layout(&state);
+        apply_palette(&state);
+        resync_volumes(&state);
         STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 
-        // Ctrl+Space can be taken (e.g. IME toggling on CJK systems): report
-        // it and fall back instead of silently doing nothing.
-        let hotkey = if RegisterHotKey(hwnd, HOTKEY_ID, MOD_CONTROL | MOD_NOREPEAT, VK_SPACE as u32) != 0 {
-            "Ctrl+Space"
-        } else if RegisterHotKey(hwnd, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE as u32) != 0 {
-            "Ctrl+Alt+Space (Ctrl+Space is registered by another application)"
-        } else {
-            "none (both hotkeys are taken; showing window now)"
-        };
-        println!("ready in {:.1} ms; hotkey: {hotkey}; Esc hides, Alt+F4 quits", (qpc() - t_start) as f64 * 1000.0 / freq as f64);
-        if hotkey.starts_with("none") || show_now {
+        // The configured hotkey can be taken by another application (Ctrl+Space
+        // often is, by IMEs on CJK systems): say so instead of doing nothing.
+        let hk = cfg.hotkey();
+        let registered = RegisterHotKey(hwnd, HOTKEY_ID, hk.win32_modifiers() | MOD_NOREPEAT, hk.vk as u32) != 0;
+        if !registered {
+            notices.push(format!("hotkey {hk} is used by another application; set general.hotkey in {}", paths.config.display()));
+        }
+        *state.notice.borrow_mut() = notices.join(" · ");
+        println!("ready in {:.1} ms; hotkey: {}; Esc hides, Alt+F4 quits", (qpc() - t_start) as f64 * 1000.0 / freq as f64, if registered { hk.to_string() } else { format!("{hk} (unavailable)") });
+        if !registered || show_now {
             show(&state);
         }
         if !selftest.is_empty() {
@@ -708,6 +822,10 @@ pub fn run() {
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        // Stops volume workers; each writes its startup snapshot.
+        if let Some(c) = &state.catalog {
+            c.shutdown();
         }
         drop(state);
         STATE.with(|s| s.borrow_mut().take());

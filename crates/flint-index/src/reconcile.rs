@@ -126,6 +126,9 @@ impl VolumeIndexer {
         for (comps, dir) in &targets {
             report.dirs += 1;
             let abs = comps.iter().fold(src.root.clone(), |p, c| p.join(c));
+            if src.is_excluded(&abs) {
+                continue;
+            }
             let dir_frn = table.read().unwrap().key(*dir);
             let items = match src.fs.list(&abs) {
                 Ok(v) => v,
@@ -157,7 +160,7 @@ impl VolumeIndexer {
                         next += 1;
                         let frn = make_frn(next, 1);
                         adds.push(FileRecord { frn, parent: dir_frn, name, attrs: a, size: (!item.is_dir).then_some(item.size), mtime: Some(mtime) });
-                        if item.is_dir && !item.is_link {
+                        if item.is_dir && !item.is_link && !src.is_excluded(&abs.join(&item.name)) {
                             src.walk_from(abs.join(&item.name), frn, comps.len() + 1, &mut next, &mut |r| {
                                 adds.push(r);
                                 true
@@ -271,8 +274,8 @@ mod tests {
     #[test]
     fn parses_notify_buffers_and_derives_dirs() {
         let a = entry(0, action::RENAMED_NEW, "Docs\\Résumé.pdf");
-        let first = entry(a.len() as u32 + 0, action::ADDED, "top.txt");
-        let mut buf = entry(first.len() as u32, action::ADDED, "top.txt");
+        let len_first = entry(0, action::ADDED, "top.txt").len() as u32;
+        let mut buf = entry(len_first, action::ADDED, "top.txt");
         buf.extend(a);
         let ev = parse_notify_buffer(&buf);
         assert_eq!(ev, vec![(action::ADDED, PathBuf::from("top.txt")), (action::RENAMED_NEW, PathBuf::from("Docs/Résumé.pdf"))]);

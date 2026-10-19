@@ -3,7 +3,14 @@
 // Off Windows only the model (and its tests) are built.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod discovery;
+#[cfg(windows)]
+mod icons;
 mod model;
+#[cfg(windows)]
+mod theme;
+#[cfg(windows)]
+mod volumes;
 #[cfg(windows)]
 mod win;
 

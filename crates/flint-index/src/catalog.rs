@@ -222,6 +222,10 @@ impl Catalog {
         }
     }
 
+    pub fn keys(&self) -> Vec<String> {
+        self.workers.lock().unwrap().keys().cloned().collect()
+    }
+
     pub fn statuses(&self) -> Vec<VolumeStatus> {
         self.workers
             .lock()
@@ -445,6 +449,7 @@ impl WorkerCtx {
                                 self.set(|s| {
                                     s.phase = Phase::Traversed { complete: rep.complete() };
                                     s.state = ix.state.clone();
+                                    s.stats = ix.stats.clone();
                                 });
                             }
                             Err(SyncError::Canceled) => break,
@@ -462,6 +467,7 @@ impl WorkerCtx {
                                 Ok(_) => self.set(|s| {
                                     s.phase = Phase::Traversed { complete: ix.state.is_complete() };
                                     s.state = ix.state.clone();
+                                    s.stats = ix.stats.clone();
                                 }),
                                 Err(e) => {
                                     backend = None;

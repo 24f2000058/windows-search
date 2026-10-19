@@ -174,6 +174,10 @@ fn open_path(path: &str, access: u32) -> Result<Handle, SourceError> {
     Ok(Handle(h))
 }
 
+// SAFETY: a volume handle may be used from any thread; NtfsVolume is only
+// ever used by one thread at a time (it is moved into a catalog worker).
+unsafe impl Send for NtfsVolume {}
+
 impl NtfsVolume {
     /// Opens the volume for journal access (requires elevation).
     pub fn open(info: VolumeInfo) -> Result<Self, SourceError> {

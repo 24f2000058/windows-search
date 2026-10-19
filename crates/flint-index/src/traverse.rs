@@ -78,6 +78,9 @@ pub struct TraversalReport {
     /// operations must not target the lossy spelling.
     pub lossy_names: u64,
     pub depth_limited: u64,
+    /// Directories skipped because the user excluded them (intentional:
+    /// does not make coverage incomplete).
+    pub excluded: u64,
     pub canceled: bool,
 }
 
@@ -95,13 +98,25 @@ pub struct TraversalSource<F: Fs = RealFs> {
     pub root: PathBuf,
     pub root_frn: Frn,
     pub fs: F,
+    /// Excluded directory prefixes (compared case-insensitively).
+    pub exclude: Vec<PathBuf>,
     pub report: TraversalReport,
     pub cancel: Arc<AtomicBool>,
 }
 
 impl<F: Fs> TraversalSource<F> {
     pub fn new(root: PathBuf, fs: F) -> Self {
-        TraversalSource { root, root_frn: make_frn(1, 1), fs, report: TraversalReport::default(), cancel: Arc::new(AtomicBool::new(false)) }
+        TraversalSource { root, root_frn: make_frn(1, 1), fs, exclude: Vec::new(), report: TraversalReport::default(), cancel: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// True if `path` is inside an excluded directory.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        let p = path.to_string_lossy().to_lowercase().replace('\\', "/");
+        self.exclude.iter().any(|e| {
+            let e = e.to_string_lossy().to_lowercase().replace('\\', "/");
+            let e = e.trim_end_matches('/');
+            !e.is_empty() && (p == e || p.starts_with(&format!("{e}/")))
+        })
     }
 
     /// Walks the tree, emitting records parents-first with synthetic FRNs.
@@ -164,10 +179,13 @@ impl<F: Fs> TraversalSource<F> {
                     return;
                 }
                 if item.is_dir && !item.is_link {
-                    if depth + 1 >= MAX_DEPTH {
+                    let child = dir.join(&item.name);
+                    if self.is_excluded(&child) {
+                        self.report.excluded += 1;
+                    } else if depth + 1 >= MAX_DEPTH {
                         self.report.depth_limited += 1;
                     } else {
-                        stack.push((dir.join(&item.name), frn, depth + 1));
+                        stack.push((child, frn, depth + 1));
                     }
                 }
             }
@@ -267,6 +285,17 @@ mod tests {
         assert_eq!(s.report.skipped.len(), 1);
         assert_eq!(s.report.entry_errors, 1);
         assert!(!s.report.complete());
+    }
+
+    #[test]
+    fn excluded_directories_are_not_descended() {
+        let mut s = TraversalSource::new("/r".into(), fake());
+        s.exclude = vec![PathBuf::from("/R/A/")];
+        let n = names(&mut s);
+        assert!(n.contains("a") && !n.contains("x.rs"), "{n:?}");
+        assert_eq!(s.report.excluded, 1);
+        assert!(s.report.complete(), "exclusion is intentional, not missing coverage");
+        assert!(s.is_excluded(Path::new("/r/a/deep/z")) && !s.is_excluded(Path::new("/r/ab")));
     }
 
     #[test]
