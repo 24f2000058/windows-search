@@ -121,7 +121,9 @@ dependencies = [
 name = "flint-ui-win32"
 version = "0.1.0"
 dependencies = [
+ "flint-commands",
  "flint-fuzzy",
+ "flint-index",
  "windows-sys",
 ]
 
