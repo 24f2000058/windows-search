@@ -20,7 +20,7 @@ Legend:
 | Windows target | Prototype | Cross-built PE binaries; no Windows CI yet |
 | Installer + portable builds | Partial | Portable mode implemented and tested (`portable.marker` next to the exe → `<exe>\data\`, verified under Wine); installer and release packaging: phase 5 |
 | Ctrl+Space default, customizable | Prototype | Default Ctrl+Space; `general.hotkey` in config.toml, parsed/validated (reserved combos rejected, tested); a taken hotkey is reported in the UI. No settings window yet |
-| Compact live UI, icons, highlights, name + path, keyboard nav | Prototype | Live results, highlights, paths, file-type icons (system image list, by type only — ADR-011), arrows/PgUp/PgDn/Enter/Esc; verified under Wine (`docs/img/phase2-wine-live-update-dark.png`) |
+| Compact live UI, icons, highlights, name + path, keyboard nav | Prototype | Live results with highlights, folder, size, local modified time and a match label; file-type icons (by type only — ADR-011); arrows/PgUp/PgDn, Shift+arrows multi-select, Tab to the filter bar, file-action shortcuts (README). Verified under Wine (`docs/img/phase3-*.png`) |
 | Themes, custom keybindings | Partial | Light/dark following the system setting or forced in config, high contrast uses system colors; both palettes pass WCAG AA (tested). In-app keybinding customization not started |
 | High-DPI | Prototype | Per-monitor v2, `WM_DPICHANGED` relayout; not tested on real displays |
 | Accessibility | Prototype | Standard controls plus plain text via `LVN_GETDISPINFO`; no UIA audit or high-contrast work |
@@ -46,10 +46,11 @@ Legend:
 | Directory renames | Tested | `directory_move_updates_whole_subtree` |
 | Other filesystems: adapters / traversal | Tested | `traverse.rs`; FAT/exFAT/ReFS → traversal |
 | Removable / network / inaccessible / disconnected volumes | Tested (sim) / Prototype | Catalog: unavailable volumes wait with backoff and report it; removal hides entries from search, re-arrival reloads from snapshot (tested); network drives excluded by default, traversed (never journaled) when enabled |
-| Never block UI | Prototype | Indexing in per-volume workers; startup loads in workers (UI shows "loading index"); RwLock contention risk remains (ADR-007) |
+| Never block UI | Prototype | Indexing in per-volume workers; startup loads in workers (UI shows "loading index"); scans apply records 4096 per lock hold and pause while the user types (ADR-014); compare/duplicate checks run off the UI thread. Not measured on hardware |
 | Never claim complete falsely | Tested | `is_complete` requires Live or a clean traversal with zero skips; UI status shows incomplete coverage |
 | SQLite or better | Tested | ADR-004 |
-| Automated correctness/recovery tests | Tested | 27 index tests including fault injection |
+| Automated correctness/recovery tests | Tested | 47 index tests including fault injection |
+| Background indexing with bounded resource use | Tested (governor) / Prototype (priorities) | ADR-014: background thread priority + EcoQoS, one heavy scan at a time (queued volumes reported), bounded pauses while typing, memory returned after scans; governor and catalog queueing tested; priority effects need hardware measurement |
 | Live updates for non-NTFS volumes (`ReadDirectoryChangesW`) | Tested (reconcile) / Prototype (watcher) | Incremental directory reconciliation tested against the real filesystem; watcher feed with overflow → full rescan; live update verified under Wine. Volumes are re-walked at each start (no journal to replay) |
 
 ## 3. Search engine
@@ -67,8 +68,9 @@ Legend:
 | Indexed retrieval, bounded ranking, caching, debouncing, cancellation, progressive rendering | Tested | Masks/pigeonhole/per-dir precompute, top-K heaps, session cache, debounce, cancel token, per-pass snapshots |
 | Never synchronous filesystem scan per keystroke | Tested | Search only reads the in-memory table |
 | Distinguish no match / incomplete index / inaccessible / canceled / exhausted | Tested | `Status` and `status_line` tests |
+| Request progressively weaker matches / remaining indexed candidates | Tested | F3 escalates to weak matches, then every remaining indexed candidate (`ux::deeper_action`, tested); the status line offers it only when available; weak rows are labelled ("fuzzy", "scattered", "weak: path", "weak: similar", "unranked") so they are never presented as relevant |
 | Controlled deep-search fallback | Not started | Phase 4 (bounded, cancellable traversal of unindexed scopes) |
-| Filters: name, path, extension, type, size, date | Tested | Query parser and filter tests. Dates are UTC (local-time handling is a gap) |
+| Filters: name, path, extension, type, size, date | Tested | Query parser and filter tests. Dates are local calendar days, DST-correct (`Clock`, tested with a 23-hour day; Windows zone rules via `SystemTimeToTzSpecificLocalTime`). `>`/`<` are strict. Filter bar (type/size/date dropdowns) edits the query text, so typed and picked filters cannot disagree (tested) |
 | Content filter | **Not started** | Reported to the user as unavailable, never silently ignored |
 | Performance targets | Partially measured | See benchmarks.md; Windows numbers pending |
 
@@ -91,10 +93,10 @@ Legend:
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
-| Custom + native shell context menu (`IContextMenu`) | Not started | |
-| Open / open with / reveal / copy / cut / paste / copy path / rename / move / delete / new folder / properties / batch / compare / duplicates | Not started | Spike only reveals in Explorer after an existence check |
-| Revalidate before destructive ops; Recycle Bin default; explicit permanent delete; race/link/collision handling | Designed | Plan: `IFileOperation` with `FOFX_RECYCLEONDELETE`; revalidate by FRN (`OpenFileById`) and path immediately before acting; preview/confirm batches |
-| Non-blocking shell operations | Not started | |
+| Custom + native shell context menu (`IContextMenu`) | Prototype | Our items above the native menu, `IContextMenu2/3` forwarding for extension-drawn items; native delete/rename intercepted into the safe pipeline (ADR-015). Shown under Wine (`docs/img/phase3-context-menu.png`); third-party extensions untested on Windows |
+| Open / open with / reveal / copy / cut / paste / copy path / rename / move / delete / new folder / properties / batch / compare / duplicates | Prototype | All implemented (`actions.rs`, `flint-ops`): `ShellExecuteExW`, `SHOpenWithDialog`, `SHOpenFolderAndSelectItems`, CF_HDROP + Preferred DropEffect clipboard, `IFileOperation`, folder picker, `SHObjectProperties`; bounded byte compare and same-size → content-confirmed duplicates (tested). Pipeline verified under Wine via `ops_probe` (`SHFileOperationW` path, as Wine lacks `IFileOperation`) |
+| Revalidate before destructive ops; Recycle Bin default; explicit permanent delete; race/link/collision handling | Tested (core) / Prototype (Win32) | ADR-015: plan → reviewed preview → final revalidation (FRN on NTFS, type/size/mtime on traversal volumes) → execute → verify by observation. 16 tests incl. fault injection: replaced/deleted/modified/unreadable between preview and execution, races during the batch check, partial/cancelled execution, roots, nested selections, move into itself, collisions, invalid names, links and hard links |
+| Non-blocking shell operations | Prototype | `IFileOperation` shows its own progress UI and runs modally from the launcher; long compares/duplicate checks run on background threads |
 
 ## 7. Content search
 
@@ -114,8 +116,8 @@ Legend:
 |---|---|---|
 | Local only, no telemetry | Tested by construction | No network code outside the explicit `/s` browser launch |
 | Search history off by default | Tested by construction | Session cache is in-memory only, cleared on hide |
-| Never execute input/files automatically | Prototype | Calculator does not evaluate code; Enter reveals rather than executes in the spike |
-| Bounded workloads | Partial | Search top-K, deadlines, calculator limits, parser bounds; preview/archive/plugin limits not built |
+| Never execute input/files automatically | Prototype | Calculator does not evaluate code; files open only on explicit Enter/double-click/Open after revalidation; previews will never execute (phase 4) |
+| Bounded workloads | Partial | Search top-K, deadlines, calculator limits, parser bounds, one heavy scan at a time, compare/duplicate read budgets (`files.*_limit_mb`); preview/archive/plugin limits not built |
 | Lazy init, bounded caches, no continuous rescans | Partial | Caches trimmed on hide; journal-driven updates; idle journal polls no longer write to disk (tested); traversal volumes watched instead of rescanned |
 | Redacted local diagnostics | Not started | |
 | Update notification, approval, integrity | Not started | |
@@ -125,7 +127,7 @@ Legend:
 
 | Requirement | Status |
 |---|---|
-| Settings (hotkeys, themes, ranking, fuzzy intensity, exhaustive, scope, …) | Partial | `config.toml` covers hotkey, theme, search (intensity, best effort, exhaustive, limits, debounce, deadline), indexing scope (volumes, removable, network, exclusions, extra folders), web search, viewer, privacy, updates, plugins. **No settings window yet** |
+| Settings (hotkeys, themes, ranking, fuzzy intensity, exhaustive, scope, …) | Partial | `config.toml` covers hotkey, theme, search (intensity, best effort, exhaustive, limits, debounce, deadline), indexing scope (volumes, removable, network, exclusions, extra folders) and resource use (background priority, concurrent scans, pause while typing), file operations (collisions, recycle confirmation, compare/duplicate limits), web search, viewer, privacy, updates, plugins. **No settings window yet** |
 | Versioned config with migration/recovery | Tested | Versioned TOML, ordered migrations with backup, malformed file moved aside, per-section/per-value reset, newer-version files never overwritten, atomic saves (`flint-config`, 9 tests); index DB schema v1→v2 migration tested |
 | Per-volume status, USN checkpoints, recovery state, latency, fuzzy stage, failures, resources, plugin errors | Partial: data exists (`VolumeIndexer::stats/state`, `Status.stages`), not yet exposed in a diagnostics view |
 
@@ -137,6 +139,7 @@ Legend:
 | Unicode, long paths, duplicates, random queries, misspellings, scattered | Tested | Except long paths: std handles `\\?\` but this is untested on Windows |
 | Inaccessible volumes, journal resets, crashes, stale records | Tested (sim) | |
 | Malformed files, rapid preview changes | Partial | Malformed USN buffers fuzzed; previews not built |
-| Destructive-operation races, archive attacks, plugin failures | Not started | Depend on unbuilt features |
+| Destructive-operation races | Tested | `flint-ops` fault-injection tests (see section 6) |
+| Archive attacks, plugin failures | Not started | Depend on unbuilt features |
 | Reproducible benchmarks with recorded conditions | Tested | `bench/results/` |
 | Signed releases, reproducible builds, SBOM | Not started | |

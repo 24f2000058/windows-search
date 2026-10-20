@@ -1,4 +1,4 @@
-# Architecture (phase 1)
+# Architecture (phase 3)
 
 ```
             ┌──────────────── UI thread (flint-ui-win32) ────────────────┐
@@ -30,9 +30,10 @@
 | `flint-fuzzy` | folding, kernels, `NameTable`, query parser, engine, session | any |
 | `flint-index` | journal model, volume state machine, SQLite store, snapshots, catalog (per-volume workers), traversal + reconciliation, NTFS simulator | any |
 | `flint-ntfs` | USN and raw `$MFT` parsers (any); Win32 `NtfsVolume`, `DirWatcher` and `ntfs_probe` (Windows) | Windows for `win`, `watch` |
+| `flint-ops` | file operations: plan/revalidate/execute/verify, path and name rules, compare, duplicates (any); `IFileOperation`, shell actions, clipboard, `IContextMenu` (Windows `win`) | Windows for `win` |
 | `flint-commands` | command registry, `/s`, calculator | any |
 | `flint-config` | versioned settings, migrations/recovery, data paths, hotkey parsing | any |
-| `flint-ui-win32` | launcher UI; `model`, `discovery` (any) + `win`, `volumes`, `theme`, `icons` (Windows) | Windows |
+| `flint-ui-win32` | launcher UI; `model`, `ux`, `discovery` (any) + `win`, `actions`, `prompt`, `volumes`, `resources`, `theme`, `icons` (Windows) | Windows |
 | `flint-bench` | engine, kernel, index benchmarks; corpus generator | any |
 
 ## Key invariants
@@ -51,6 +52,11 @@
   calls; a panic in the window procedure is caught, not unwound into user32.
 * **Exhaustion scope.** `indexed_exhausted` refers to indexed candidates only;
   the UI adds index coverage separately.
+* **No blind file operations.** Every destructive action is planned against
+  the live filesystem, reviewed, revalidated immediately before acting and
+  verified afterwards by observation (ADR-015).
+* **Indexing yields.** Worker threads run at background priority; one heavy
+  scan runs at a time and pauses (boundedly) while the user types (ADR-014).
 
 ## Startup sequence
 
@@ -66,7 +72,8 @@
 ## Threads at idle
 
 UI thread (blocked in `GetMessage`), search worker (blocked on a channel),
-the rayon pool (parked), and one catalog worker per volume:
+the rayon pool (parked), and one catalog worker per volume, at background
+priority:
 
 * a journal volume polls once per second (an empty poll does no disk
   write)
