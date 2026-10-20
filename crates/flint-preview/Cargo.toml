@@ -1,0 +1,16 @@
+[package]
+name = "flint-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated, bounded file previews and text extraction"
+
+[dependencies]
+miniz_oxide = "0.9.1"
+
+[[bin]]
+name = "flint-preview-host"
+path = "src/bin/host.rs"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_Graphics_Gdi", "Win32_UI_Shell"] }
