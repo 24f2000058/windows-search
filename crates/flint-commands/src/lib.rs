@@ -4,6 +4,7 @@
 //! the action when the user explicitly activates the result, re-validating
 //! URLs before handing them to the shell. Nothing here executes input.
 
+pub mod app;
 pub mod calc;
 pub mod websearch;
 
@@ -13,7 +14,16 @@ pub enum Action {
     /// Open an http(s) URL in the default browser.
     OpenUrl(String),
     CopyText(String),
+    /// One of the launcher's own screens.
+    App(AppAction),
     None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppAction {
+    Diagnostics,
+    CheckUpdates,
+    Plugins,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +54,7 @@ impl Registry {
         let mut r = Registry::default();
         r.register(Box::new(websearch::WebSearch { provider: search }));
         r.register(Box::new(calc::Calculator));
+        r.register(Box::new(app::AppCommands));
         r
     }
 
@@ -86,6 +97,6 @@ mod tests {
     fn duplicate_ids_are_rejected() {
         let mut r = Registry::with_builtins(websearch::Provider::duckduckgo());
         assert!(!r.register(Box::new(calc::Calculator)));
-        assert_eq!(r.ids(), vec!["websearch", "calc"]);
+        assert_eq!(r.ids(), vec!["websearch", "calc", "app"]);
     }
 }

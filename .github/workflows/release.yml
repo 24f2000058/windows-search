@@ -1,0 +1,45 @@
+# Release on a version tag (v*): reproducible build, MSI, portable zip,
+# SBOM, notices, checksums and the update manifest, published as a draft
+# release for a maintainer to review.
+#
+# Secrets (optional; without them the artifacts are unsigned and the run
+# says so):
+#   FLINT_UPDATE_SIGNING_KEY  ed25519 secret key (hex) for update.json
+#   FLINT_UPDATE_KEY_ID       its id in crates/flint-update/update-keys.txt
+#   Authenticode: wire FLINT_SIGN_CMD to your signing service (for example
+#   SignPath Foundation or Azure Trusted Signing) in the build step.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wixl msitools
+      - run: cargo install --locked cargo-cyclonedx cargo-deny
+      - name: Check the tag matches the workspace version
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
+      - name: Reproducibility check
+        run: tools/release.sh --check-repro
+      - name: Build artifacts
+        env:
+          FLINT_UPDATE_SIGNING_KEY: ${{ secrets.FLINT_UPDATE_SIGNING_KEY }}
+          FLINT_UPDATE_KEY_ID: ${{ secrets.FLINT_UPDATE_KEY_ID }}
+        run: tools/release.sh
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          cd "dist/$V"
+          gh release create "$GITHUB_REF_NAME" --draft --title "Flint $V" --notes "See SHA256SUMS. SBOMs are in sbom/." \
+            Flint-*.msi Flint-*-portable.zip flint-plugin-epoch-*.zip THIRD-PARTY-NOTICES.txt SHA256SUMS update.json $(ls update.json.sig 2>/dev/null) sbom/*.json

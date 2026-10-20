@@ -31,6 +31,9 @@
 | `flint-index` | journal model, volume state machine, SQLite store, snapshots, catalog (per-volume workers), governor, traversal + reconciliation, content index (FTS5), deep search, NTFS simulator | any |
 | `flint-ntfs` | USN and raw `$MFT` parsers (any); Win32 `NtfsVolume`, `DirWatcher` and `ntfs_probe` (Windows) | Windows for `win`, `watch` |
 | `flint-preview` | wire protocol, preview/extraction backends, ZIP reader, limits (any); `flint-preview-host` helper, client with timeout/restart, viewer scheduler; shell thumbnails and Job Object (Windows) | any; `win` Windows |
+| `flint-plugin` | manifest validation, approvals bound to a folder hash, length-prefixed JSON protocol, plugin process host (timeouts, backoff, strikes, output clamping), latest-wins service; low-integrity + Job Object spawn (Windows) | any; `win` Windows |
+| `flint-plugin-epoch` | sample plugin and protocol reference | any |
+| `flint-update` | ed25519-signed update manifests, version policy, verified downloads, `flint-release` maintainer tool; WinHTTP fetcher (Windows) | any; `win` Windows |
 | `flint-ops` | file operations: plan/revalidate/execute/verify, path and name rules, compare, duplicates (any); `IFileOperation`, shell actions, clipboard, `IContextMenu` (Windows `win`) | Windows for `win` |
 | `flint-commands` | command registry, `/s`, calculator | any |
 | `flint-config` | versioned settings, migrations/recovery, data paths, hotkey parsing | any |

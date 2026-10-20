@@ -206,7 +206,7 @@ delays a journal batch; a long batch delays a keystroke. Measure "UI input
 latency during indexing" on the reference PC. If p95 >50 ms, move to epoch
 snapshots (copy-on-write chunks) so readers never wait.
 
-## ADR-008 Plugins — Designed, not implemented
+## ADR-008 Plugins — Implemented (commands and result actions; see ADR-019)
 
 * Out-of-process helpers, one per plugin, speaking a versioned
   length-prefixed JSON protocol over anonymous pipes. Capabilities:
@@ -556,6 +556,124 @@ Rules:
   (file operations use the weaker type, size and mtime check). They are
   removed when the query changes or the launcher hides.
 
+## ADR-019 Plugins: approved, confined helper processes — Accepted
+
+Implements ADR-008 for **commands** (prefix-triggered results) and
+**result actions** (context-menu entries on selected files). Format
+handlers and metadata providers are not in API 1. Protocol and author
+guide: [plugins.md](plugins.md).
+
+* **Off by default** (`plugins.enabled`). With plugins off, no plugin
+  folder is read. With plugins on, folders are discovered and hashed at
+  startup, but nothing runs until used.
+* **Approval is bound to content.** The approval records a SHA-256 over
+  every file in the plugin's folder (links refused) plus the permission
+  set. Any change means approve again. The folder is re-hashed before every
+  process start, so files swapped after approval are refused. Approvals are
+  stored outside the plugin folders and fail closed if unreadable.
+* **Permissions limit what Flint does**: passing paths, opening URLs,
+  allowing child processes. `network` is declared but unenforceable. The
+  approval prompt says this, and that isolation "is not a security
+  sandbox".
+* **Confinement (Windows):**
+  * a low-integrity token (falling back to normal integrity in the same
+    job, which `/diag` reports)
+  * a Job Object: memory limit, 25% hard CPU cap, one active process
+    unless `launch_processes`, UI restrictions, kill on close
+  * only the pipe handles are inherited
+  * no AppContainer, so network and read access are not restricted
+* **Recovery:**
+  * per-request timeout (manifest, at most 10 s), then kill
+  * restart with exponential backoff
+  * malformed, oversized (> 1 MiB) or mismatched replies kill the process
+  * 3 strikes per session disable the plugin until restart
+  * `error` replies are not strikes
+* **Output is untrusted:**
+  * at most 20 items
+  * text clamped, control and bidi characters stripped
+  * `open_url` stripped without the permission and re-checked at Enter
+* **Resources:** queries are latest-wins on a per-plugin worker thread.
+  Every plugin process is stopped when the launcher hides.
+* **Tests:** 11 unit tests and 13 against a real plugin process, covering protocol
+  round trip, withheld paths, crash/hang/garbage/oversize/wrong-id
+  recovery, strikes, error answers, flooding, permission stripping, API
+  mismatch, changed files and latest-wins. The confined spawn ran under
+  Wine; Wine does not enforce integrity levels or the job's process
+  limit, so those need Windows hardware.
+
+## ADR-020 Updates: manual by default, signed manifest, verified download — Accepted
+
+* `updates.mode`: `off`, `manual` (default: the network is contacted only
+  on `/update`) or `notify` (at most every `check_interval_hours`, first
+  check 15 minutes after start, status line only). Config v1 files had
+  `notify` written as an unused default; migration v1→v2 turns that into
+  `manual`.
+* **Signed manifest.** A release publishes `update.json` and
+  `update.json.sig`. The signature is ed25519 over
+  `"flint-update-manifest-v1\n" + bytes`, with a key compiled into the build
+  (`crates/flint-update/update-keys.txt`; several keys allow rotation). The
+  manifest is parsed only after the signature verifies. The product must be
+  `flint`, URLs must be https, and assets carry size and SHA-256.
+* **Policy:**
+  * only a strictly newer version is offered (no rollback)
+  * pre-releases are offered only to pre-release builds
+  * the download is capped at the signed size and must match the digest
+    before anything is offered to run
+* **Approval at every step:**
+  * "Download and verify?"
+  * then "Verified. Install now?", which starts `msiexec` and closes Flint
+  * portable copies get the verified zip revealed with instructions; no
+    self-replacement
+* **Transport:** WinHTTP (system TLS, certificates and proxy; https→http
+  redirects refused). Integrity does not depend on the transport.
+* **No key yet.** The project has no release key (open decision), so
+  current builds report that they cannot verify updates and offer the
+  releases page. They never download.
+* **Tests:** signature acceptance and rejection, tampering at any byte,
+  context separation, unsafe signed content, version policy, and download
+  size/digest checks. Wine runs exercised the WinHTTP path against a local
+  server: genuine, padded and tampered releases.
+
+## ADR-021 Packaging and release — Accepted
+
+* **Installer:** a per-user MSI (`installer/flint.wxs`, built with `wixl`
+  on Linux).
+  * no elevation; installs to `%LOCALAPPDATA%\Programs\Flint`
+  * Start menu shortcut, plus a separate "Autostart" feature (HKCU Run)
+  * major upgrades; downgrades refused
+  * uninstall runs `flint --quit`, then `flint --cleanup-data`, which
+    removes the index and caches but keeps settings, plugins and approvals
+  * `REMOVEDATA=1` removes the whole data folder
+  * cleanup refuses any folder that is not a Flint data folder
+  * verified under Wine: install, launch, uninstall with and without
+    `REMOVEDATA`
+* **Portable:** a zip with `portable.marker`; all data stays in `data\`.
+* **Executable:** release builds use the `gui` subsystem (no console). An
+  embedded manifest sets common controls v6, per-monitor-v2 DPI,
+  long-path awareness, UTF-8 code page and asInvoker, and adds version
+  info.
+* **Reproducible builds** (`tools/release.sh`):
+  * flags: `--locked`, remapped path prefixes, no PE timestamp,
+    `SOURCE_DATE_EPOCH` for archives
+  * `--check-repro` builds twice in different directories; the three
+    executables were byte-identical here
+  * the MSI is not byte-reproducible (wixl writes a random package code);
+    its product code is derived from the version
+* **SBOM:** CycloneDX 1.5 JSON for the shipped binaries
+  (`cargo-cyclonedx`).
+* **Notices:** `THIRD-PARTY-NOTICES.txt` carries license files of the 65
+  linked crates.
+* **License gate:** `cargo deny check licenses` against a permissive
+  allow-list (`deny.toml`), in CI and before every release build.
+* **Signing:** Authenticode is a hook (`FLINT_SIGN_CMD`); without it the
+  script labels each artifact unsigned. The update manifest is signed
+  when `FLINT_UPDATE_SIGNING_KEY` is set.
+* **CI** (`.github/workflows`):
+  * tests and clippy on Linux and the Windows target
+  * native Windows tests and the license gate
+  * on `v*` tags, a reproducibility check and a draft GitHub release
+  * not yet run on GitHub: written and syntax-checked here
+
 ## Open decisions needing the owner
 
 1. **Elevation/service scope** (ADR-005). Without elevation, NTFS volumes
@@ -563,8 +681,12 @@ Rules:
    build and re-walked at each start.
 2. **Final project name.** "Flint" is a working name. The license is
    decided (ADR-013).
-3. **Code signing** certificate and update channel, needed for signed
-   releases and update integrity. Free options for open-source projects
-   exist (e.g. SignPath Foundation), as does Azure Trusted Signing.
+3. **Code signing** (Authenticode) for the executables and MSI. Free
+   options for open-source projects exist (e.g. SignPath Foundation), as
+   does Azure Trusted Signing. Wire it in through `FLINT_SIGN_CMD`.
+4. **Update-signing key** (ADR-020): run `flint-release keygen` offline,
+   add the public line to `crates/flint-update/update-keys.txt`, and store
+   the secret as the `FLINT_UPDATE_SIGNING_KEY` repository secret. Until
+   then builds cannot verify, and so never install, updates.
 
 Resolved: reference PC and memory budget (ADR-013), license (ADR-013).

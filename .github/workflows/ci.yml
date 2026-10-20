@@ -1,0 +1,36 @@
+# Tests, lints, Windows cross-build and the license gate on every push/PR.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+      - run: cargo build --locked --target x86_64-pc-windows-gnu -p flint-ui-win32 -p flint-preview -p flint-plugin-epoch
+  windows:
+    # Native Windows: the Win32 code paths that Linux and Wine cannot prove.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+  licenses:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

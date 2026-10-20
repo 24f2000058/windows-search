@@ -101,13 +101,38 @@ Remaining from phase 4:
   and `preview_probe.exe` on real files.
 - [ ] Deep search inside `path:` scopes that lie outside the index.
 
-## Phase 5: plugins, diagnostics, release
+## Phase 5: plugins, diagnostics, release — done (pending hardware validation and owner decisions)
 
-1. Plugin host (ADR-008), permission UI, crash recovery tests.
-2. Diagnostics view (per-volume state, checkpoints, latency, stages,
-   failures, resources) with redaction-by-default export.
-3. Installer (MSIX/WiX) plus portable zip, clean uninstall.
-4. Update checks with user approval and signature verification before
-   install.
-5. Signed, reproducible release builds, SBOM (`cargo cyclonedx`), license
-   CI gate.
+Done (see requirements.md for evidence):
+
+- [x] Plugin host, ADR-019 ([plugins.md](plugins.md)):
+  * versioned JSON protocol and a strict manifest
+  * approval bound to a folder hash and the permission set
+  * low integrity plus Job Object confinement on Windows
+  * timeouts, backoff and session strikes
+  * clamped output; sample plugin; recovery tests
+- [x] Diagnostics (`/diag`): per-volume state and checkpoints, latency,
+  stages, failures, resources, plugin health; redacted by default; copy
+  and save.
+- [x] Updates, ADR-020: manual by default, ed25519-signed manifest, no
+  rollback, verified download, approval before download and install.
+- [x] Installer and portable, ADR-021: per-user MSI with clean uninstall,
+  deterministic portable zip, embedded manifest, GUI subsystem.
+- [x] Release tooling: reproducible executables, SBOM, notices, license
+  gate, checksums, CI and release workflows.
+
+Remaining:
+
+- [ ] Owner decisions: Authenticode signing service, update-signing key,
+  final name (decisions.md).
+- [ ] Run the CI and release workflows on GitHub (written and
+  syntax-checked, not yet run).
+- [ ] Validate on Windows hardware:
+  * low-integrity plugin launch and the Job Object child-process and CPU
+    limits
+  * WinHTTP against GitHub
+  * MSI install/upgrade/uninstall
+  * the `/diag` window
+- [ ] Plugin API 2 candidates: format handlers and metadata providers
+  (ADR-008), and an AppContainer to restrict network and reads.
+- [ ] A settings window (settings are still edited in `config.toml`).
