@@ -7,6 +7,7 @@ that are not explicitly approved. Bundled native code: SQLite (public domain) vi
 
 | Crate | Version | License |
 |---|---|---|
+| adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |
 | cc | 1.9.0 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 |
@@ -29,6 +30,7 @@ that are not explicitly approved. Bundled native code: SQLite (public domain) vi
 | libsqlite3-sys | 0.38.2 | MIT |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | memchr | 2.8.3 | Unlicense OR MIT |
+| miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | pkg-config | 0.3.34 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
@@ -68,4 +70,4 @@ that are not explicitly approved. Bundled native code: SQLite (public domain) vi
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 |
 | winnow | 1.0.4 | MIT |
 
-60 crates. Distinct license expressions: `(MIT OR Apache-2.0) AND Unicode-3.0`; `Apache-2.0 OR MIT`; `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; `MIT`; `MIT OR Apache-2.0`; `MIT/Apache-2.0`; `Unlicense OR MIT`; `Zlib`; `Zlib OR Apache-2.0 OR MIT`
+62 crates. Distinct license expressions: `(MIT OR Apache-2.0) AND Unicode-3.0`; `0BSD OR MIT OR Apache-2.0`; `Apache-2.0 OR MIT`; `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; `MIT`; `MIT OR Apache-2.0`; `MIT OR Zlib OR Apache-2.0`; `MIT/Apache-2.0`; `Unlicense OR MIT`; `Zlib`; `Zlib OR Apache-2.0 OR MIT`

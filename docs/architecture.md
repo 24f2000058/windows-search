@@ -1,4 +1,4 @@
-# Architecture (phase 3)
+# Architecture (phase 4)
 
 ```
             ┌──────────────── UI thread (flint-ui-win32) ────────────────┐
@@ -28,8 +28,9 @@
 | Crate | Purpose | Platform |
 |---|---|---|
 | `flint-fuzzy` | folding, kernels, `NameTable`, query parser, engine, session | any |
-| `flint-index` | journal model, volume state machine, SQLite store, snapshots, catalog (per-volume workers), traversal + reconciliation, NTFS simulator | any |
+| `flint-index` | journal model, volume state machine, SQLite store, snapshots, catalog (per-volume workers), governor, traversal + reconciliation, content index (FTS5), deep search, NTFS simulator | any |
 | `flint-ntfs` | USN and raw `$MFT` parsers (any); Win32 `NtfsVolume`, `DirWatcher` and `ntfs_probe` (Windows) | Windows for `win`, `watch` |
+| `flint-preview` | wire protocol, preview/extraction backends, ZIP reader, limits (any); `flint-preview-host` helper, client with timeout/restart, viewer scheduler; shell thumbnails and Job Object (Windows) | any; `win` Windows |
 | `flint-ops` | file operations: plan/revalidate/execute/verify, path and name rules, compare, duplicates (any); `IFileOperation`, shell actions, clipboard, `IContextMenu` (Windows `win`) | Windows for `win` |
 | `flint-commands` | command registry, `/s`, calculator | any |
 | `flint-config` | versioned settings, migrations/recovery, data paths, hotkey parsing | any |
@@ -55,6 +56,9 @@
 * **No blind file operations.** Every destructive action is planned against
   the live filesystem, reviewed, revalidated immediately before acting and
   verified afterwards by observation (ADR-015).
+* **Contents are read only in the helper.** Previews and content
+  extraction run in `flint-preview-host` under timeouts and limits; the
+  launcher process never parses file contents (ADR-016).
 * **Indexing yields.** Worker threads run at background priority; one heavy
   scan runs at a time and pauses (boundedly) while the user types (ADR-014).
 

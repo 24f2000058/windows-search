@@ -221,7 +221,7 @@ snapshots (copy-on-write chunks) so readers never wait.
   **This is not a sandbox guarantee** and the UI will not claim one.
 * The core works with every plugin disabled.
 
-## ADR-009 Preview backends — Candidates only (phase 4)
+## ADR-009 Preview backends — Candidates (built-in subset implemented, see ADR-016)
 
 | Format | Candidate | License | Isolation |
 |---|---|---|---|
@@ -428,6 +428,133 @@ extensions keep working).
 
 Opening a file happens only on an explicit request (Enter, double-click,
 "Open"), after revalidation.
+
+## ADR-016 Previews run in an isolated, bounded helper — Accepted
+
+Every parser of file contents runs in `flint-preview-host`, a separate
+process the launcher talks to over pipes, using a length-prefixed binary
+protocol. The reader bounds-checks every length and refuses frames above
+8 MB before allocating. Windows shell thumbnails also run there, because
+thumbnail handlers are third-party code.
+
+**Containment**
+* **Crashes and hangs.** A request that does not answer within
+  `viewer.timeout_ms` (default 3 s) kills the helper. A crash or timeout
+  costs only that file; the helper restarts on demand with exponential
+  backoff (100 ms doubling to 30 s).
+* **Memory.** On Windows the helper runs in a Job Object: memory limit
+  `viewer.helper_memory_mb` (256), kill on job close, no crash dialogs.
+* **Not a security sandbox.** Process isolation limits the damage of a
+  parser bug, and nothing claims more.
+
+**Limits inside the helper** (`Limits`)
+* bytes read per file
+* characters returned
+* archive entries listed
+* bytes inflated per archive member
+* declared compression ratio
+* thumbnail edge
+
+**Backends** (built in, no new native code; `miniz_oxide` for deflate)
+* text, with BOM, UTF-8 and Windows-1252 detection
+* HTML, with scripts and styles dropped
+* DOCX, XLSX, PPTX, ODF and EPUB text
+* ZIP listing
+* image dimensions from headers, plus a shell thumbnail on Windows
+* hex of the first 4 KB of other binaries
+
+Programs are never previewed or run. PDF is stated as unsupported rather
+than shown wrong.
+
+**Archives** are listed, never extracted, and nested archives are never
+opened. Zip-bomb heuristics:
+* huge declared totals or compression ratios
+* overlapping entries (the "quoted overlap" construction)
+* nested archives
+
+A member is inflated only under the ratio limit, and only up to
+`max_inflate` whatever its header claims.
+
+**Scheduling** (`scheduler::Viewer`)
+* Each request carries the selection generation, and only the latest wins.
+* Selection changes are debounced (60 ms).
+* Results arriving after the selection moved on are dropped.
+* The cache is keyed by path, size, mtime and file ID, and bounded by bytes
+  and entries.
+
+**Off means off.** The viewer is off by default (`viewer.enabled`, F9 per
+session). While it is off, and whenever the launcher is hidden, no viewer
+thread or helper exists and no file is read.
+
+**Tests**
+* wire round-trips and every truncation
+* crash, hang, backoff and missing-helper cases against the real binary
+* rapid selection: 200 selections cause at most 2 previews and exactly 1
+  delivery
+* stale results dropped
+* cache bounds
+* zip bombs and overlap bombs
+* thousands of mutated archives and random inputs per backend, with no
+  panic
+
+Other candidates in ADR-009 (PDFium, WIC decoding in the helper, Office
+preview handlers, media) remain open. Each would be added as a helper
+backend under the same limits.
+
+## ADR-017 Selective content index — Accepted
+
+Content indexing reads file contents, so it is **opt-in**
+(`privacy.content_indexing`, default off).
+
+**What is read**
+* Only files under `content.roots` (default: Documents and Desktop).
+* Only the configured extensions (text, markup and Office formats).
+* Only files under `content.max_file_mb`.
+* Never anything under `indexing.excluded_paths`, `content.excluded_paths`,
+  or built-in sensitive locations (AppData, `.ssh`, `.gnupg`, cloud CLI
+  credential folders, Windows credential stores). This holds whatever the
+  roots say.
+
+**How it is stored and searched**
+* Text comes from the isolated helper (ADR-016). The filename index never
+  depends on extraction succeeding.
+* Storage is a separate SQLite database, `content.db`, using FTS5 with
+  `unicode61` and diacritics removed. Content data can be deleted on its
+  own.
+* Every file has an explicit state, with the reason kept: `indexed`,
+  `truncated`, `unsupported` (e.g. PDF), `too_large` (never read) or
+  `failed` (including helper crashes and timeouts).
+* Files are re-extracted when size or mtime change and dropped when they
+  vanish.
+* The syncer runs at background priority, under the same one-heavy-scan
+  rule and typing pauses as indexing (ADR-014). It re-syncs when the
+  filename index changes (at most once a minute) or every
+  `content.resync_minutes`.
+* `content:` filters go through the engine (`ContentMatch`).
+  * User text is turned into quoted FTS terms, so it is never interpreted
+    as FTS syntax.
+  * Several words: `content:"two words"`.
+* Coverage caveats appear in the status line: "content index: N file(s)
+  not yet read", or a note that the result cap was hit.
+* With the index off, `content:` says so and is never silently ignored.
+
+## ADR-018 Deep search of unindexed locations — Accepted
+
+F4 walks, on demand only, locations the index does not cover:
+* volumes skipped by settings (removable, network, optical, not listed)
+* folders the last traversal could not read
+
+Rules:
+* **Bounded.** The walk is breadth-first and cancellable. It stops at
+  `deep_search.max_entries`, `max_seconds` or `max_depth`, and the report
+  names the limit hit. A partial walk is never shown as a full one.
+* **No-go areas.** The walk never enters excluded or sensitive folders and
+  never follows links.
+* **Ranking and results.** Ranking uses the normal engine over a
+  temporary table. Hits are inserted into the shared table under a
+  reserved volume, labelled "deep (unindexed)", and act like other results
+  (file operations use the weaker type, size and mtime check). They are
+  removed when the query changes or the launcher hides.
 
 ## Open decisions needing the owner
 

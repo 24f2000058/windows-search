@@ -4,7 +4,7 @@ Flint (working name) is a keyboard-driven Windows launcher. It does indexed
 filesystem search with aggressive, progressive fuzzy matching, and keeps all
 processing local.
 
-**State: phase 3 of 5.** Open source under MIT OR Apache-2.0.
+**State: phase 4 of 5.** Open source under MIT OR Apache-2.0.
 
 * **Implemented and tested on Linux:**
   * the search engine, index persistence/recovery, multi-volume catalog,
@@ -12,6 +12,8 @@ processing local.
   * background-indexing governance
   * the file-operation pipeline (plan, review, revalidate, verify), with
     fault-injection tests
+  * isolated, bounded previews, the opt-in content index and deep search,
+    with archive-bomb, malformed-file and rapid-selection tests
 * **Prototypes, not yet validated on Windows hardware:**
   * the Windows adapters (raw `$MFT` reader, USN journal,
     `ReadDirectoryChangesW`)
@@ -19,8 +21,8 @@ processing local.
   * the launcher UI
 
   They are compile-checked and run end to end under Wine.
-* **Not started:** viewer, content search, plugins and packaging
-  (phases 4–5).
+* **Not started:** plugins, diagnostics view and packaging (phase 5).
+  PDF and media previews are not built yet.
 
 The full status per requirement is in
 [docs/requirements.md](docs/requirements.md).
@@ -37,6 +39,7 @@ Designed for any Windows 10/11 PC with 8 GB RAM (ADR-013):
 crates/flint-fuzzy      search engine: folding, bit-parallel kernels, name table, query parser, staged engine, live session
 crates/flint-index      journal model, per-volume state machine, SQLite store, traversal fallback, NTFS simulator
 crates/flint-ntfs       USN V2/V3 parser (fuzzed) + Win32 MFT/USN JournalSource + ntfs_probe example
+crates/flint-preview    isolated preview/extraction helper (flint-preview-host), backends, limits, scheduler
 crates/flint-ops        safe file operations (plan/revalidate/verify, compare, duplicates) + Windows shell integration
 crates/flint-commands   command registry, /s web search, safe calculator
 crates/flint-config     versioned settings (TOML), migrations/recovery, data paths, hotkey parsing
@@ -50,7 +53,7 @@ docs/                   architecture, decisions (ADRs), requirements, benchmarks
 ## Build and test
 
 ```sh
-cargo test --release                       # 143 tests (Linux or Windows)
+cargo test --release                       # 175 tests (Linux or Windows)
 cargo build --release -p flint-bench
 ./target/release/flint-bench engine --n 1000000
 
@@ -59,6 +62,7 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu -p flint-ui-win32
 cargo build --release --target x86_64-pc-windows-gnu -p flint-ntfs --example ntfs_probe
 cargo build --release --target x86_64-pc-windows-gnu -p flint-ops --example ops_probe
+cargo build --release --target x86_64-pc-windows-gnu -p flint-preview --bins --examples
 ```
 
 ## Trying it on Windows
@@ -69,6 +73,10 @@ cargo build --release --target x86_64-pc-windows-gnu -p flint-ops --example ops_
 * `ops_probe.exe` runs copy, rename, new folder, move, recycle, permanent
   delete, and a replaced-file check through the real file-operation
   pipeline, on a scratch folder in `%TEMP%`.
+* `preview_probe.exe FILE...` prints what the preview helper returns for
+  each file, with timings.
+* `flint-preview-host.exe` must sit next to `flint-ui-win32.exe`. It is the
+  helper that reads file contents for the viewer and the content index.
 * `flint-ui-win32.exe` indexes all volumes by settings. NTFS volumes use
   the change journal if the process can open it (elevated); otherwise they
   use traversal plus change notifications. Options:
@@ -90,6 +98,8 @@ cargo build --release --target x86_64-pc-windows-gnu -p flint-ops --example ops_
 | Shift+Enter | Open with… |
 | Alt+Enter | Properties |
 | F3 | Search deeper: weaker matches, then all remaining indexed candidates |
+| F4 | Deep search: walk unindexed locations (skipped volumes, unreadable folders), within limits |
+| F9 | Viewer pane on/off (off by default; `viewer.enabled`) |
 | F2 | Rename |
 | Ctrl+Del | Delete to the Recycle Bin (batches are previewed first) |
 | Ctrl+Shift+Del | Delete permanently (always previewed; defaults to No) |
@@ -118,7 +128,10 @@ Rows are labelled "fuzzy", "scattered", "weak: path", "weak: similar" or
   * `path:docs`
 * `/s query` searches the web (explicit only). `=1+2` or `2*(3+4)` uses the
   calculator.
-* `content:` reports "not available yet". It is never silently ignored.
+* `content:word` or `content:"two words"` searches file contents. This
+  needs `privacy.content_indexing = true` (off by default) and covers
+  Documents and Desktop unless `content.roots` says otherwise. When off,
+  the status line says so; it is never silently ignored.
 
 ## Key documents
 

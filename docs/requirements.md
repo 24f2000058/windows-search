@@ -69,9 +69,9 @@ Legend:
 | Never synchronous filesystem scan per keystroke | Tested | Search only reads the in-memory table |
 | Distinguish no match / incomplete index / inaccessible / canceled / exhausted | Tested | `Status` and `status_line` tests |
 | Request progressively weaker matches / remaining indexed candidates | Tested | F3 escalates to weak matches, then every remaining indexed candidate (`ux::deeper_action`, tested); the status line offers it only when available; weak rows are labelled ("fuzzy", "scattered", "weak: path", "weak: similar", "unranked") so they are never presented as relevant |
-| Controlled deep-search fallback | Not started | Phase 4 (bounded, cancellable traversal of unindexed scopes) |
+| Controlled deep-search fallback | Tested (core) / Prototype (UI) | ADR-018: F4 walks volumes skipped by settings and folders traversal could not read; breadth-first, entry/time/depth limits named in the result, cancellable, never enters excluded/sensitive folders or follows links (6 tests); hits labelled "deep (unindexed)" |
 | Filters: name, path, extension, type, size, date | Tested | Query parser and filter tests. Dates are local calendar days, DST-correct (`Clock`, tested with a 23-hour day; Windows zone rules via `SystemTimeToTzSpecificLocalTime`). `>`/`<` are strict. Filter bar (type/size/date dropdowns) edits the query text, so typed and picked filters cannot disagree (tested) |
-| Content filter | **Not started** | Reported to the user as unavailable, never silently ignored |
+| Content filter | Tested (core) / Prototype (UI) | `content:word` / `content:"two words"` via the engine's `ContentMatch` hook and the FTS5 content index (ADR-017); with the index off it is reported as unavailable with the reason, never ignored; coverage caveats in the status line. Verified end to end under Wine (`docs/img/phase4-content-search.png`) |
 | Performance targets | Partially measured | See benchmarks.md; Windows numbers pending |
 
 ## 4. Commands
@@ -87,7 +87,8 @@ Legend:
 
 | Requirement | Status |
 |---|---|
-| All preview formats, playback, OCR, isolation, limits, stale-preview prevention, cache invalidation, disabled = no work | **Designed** (ADR-009); no code |
+| Isolation, limits, stale-preview prevention, cache invalidation, disabled = no work | Tested | ADR-016: helper process (timeout kill, restart with backoff, Job Object memory limit on Windows), per-request limits, generation-tagged latest-wins scheduler, identity-keyed bounded cache; viewer off by default and no helper while off or hidden. Tests against the real helper binary |
+| Formats | Partial | Text (encodings), HTML, DOCX/XLSX/PPTX/ODF/EPUB text, ZIP listing with bomb warnings, image dimensions + shell thumbnail (Windows), hex for other binaries; programs never previewed. **Not yet:** PDF, image decoding beyond shell thumbnails, Office preview handlers, audio/video playback, OCR (ADR-009 candidates) |
 
 ## 6. Windows integration and file operations
 
@@ -102,7 +103,7 @@ Legend:
 
 | Requirement | Status |
 |---|---|
-| Selective persistent content index, exclusions, deep-search fallback, bounded extraction, metadata unaffected by failures | **Not started** (phase 4) |
+| Selective persistent content index, exclusions, deep-search fallback, bounded extraction, metadata unaffected by failures | Tested (core) / Prototype (Windows) — ADR-017/018: opt-in, roots/extensions/size limits, user + built-in sensitive exclusions, explicit per-file states (indexed, truncated, unsupported, too_large, failed), extraction in the isolated helper, separate database, governed background sync; PDF text not supported (stated) |
 
 ## 8. Plugins
 
@@ -127,7 +128,7 @@ Legend:
 
 | Requirement | Status |
 |---|---|
-| Settings (hotkeys, themes, ranking, fuzzy intensity, exhaustive, scope, …) | Partial | `config.toml` covers hotkey, theme, search (intensity, best effort, exhaustive, limits, debounce, deadline), indexing scope (volumes, removable, network, exclusions, extra folders) and resource use (background priority, concurrent scans, pause while typing), file operations (collisions, recycle confirmation, compare/duplicate limits), web search, viewer, privacy, updates, plugins. **No settings window yet** |
+| Settings (hotkeys, themes, ranking, fuzzy intensity, exhaustive, scope, …) | Partial | `config.toml` covers hotkey, theme, search (intensity, best effort, exhaustive, limits, debounce, deadline), indexing scope (volumes, removable, network, exclusions, extra folders) and resource use (background priority, concurrent scans, pause while typing), file operations (collisions, recycle confirmation, compare/duplicate limits), viewer (limits, thumbnails, helper timeout/memory), content index (roots, extensions, exclusions, limits), deep search limits, web search, privacy, updates, plugins. **No settings window yet** |
 | Versioned config with migration/recovery | Tested | Versioned TOML, ordered migrations with backup, malformed file moved aside, per-section/per-value reset, newer-version files never overwritten, atomic saves (`flint-config`, 9 tests); index DB schema v1→v2 migration tested |
 | Per-volume status, USN checkpoints, recovery state, latency, fuzzy stage, failures, resources, plugin errors | Partial: data exists (`VolumeIndexer::stats/state`, `Status.stages`), not yet exposed in a diagnostics view |
 
@@ -138,8 +139,9 @@ Legend:
 | ≥100k / 1M file tests | Tested | Benchmarks at 100k/1M; index tests to 120k; persistence at ~1M |
 | Unicode, long paths, duplicates, random queries, misspellings, scattered | Tested | Except long paths: std handles `\\?\` but this is untested on Windows |
 | Inaccessible volumes, journal resets, crashes, stale records | Tested (sim) | |
-| Malformed files, rapid preview changes | Partial | Malformed USN buffers fuzzed; previews not built |
+| Malformed files, rapid preview changes | Tested | Malformed USN buffers fuzzed; every preview backend fed thousands of mutated/random inputs (no panics, bounded output); every truncation of protocol messages rejected; rapid selection (200 changes → 1 delivery, ≤2 previews) |
 | Destructive-operation races | Tested | `flint-ops` fault-injection tests (see section 6) |
-| Archive attacks, plugin failures | Not started | Depend on unbuilt features |
+| Archive attacks | Tested | Ratio, total-size and overlapping-entry zip bombs detected and never inflated; Office part bombs refused; nested archives never opened |
+| Plugin failures | Not started | Phase 5 |
 | Reproducible benchmarks with recorded conditions | Tested | `bench/results/` |
 | Signed releases, reproducible builds, SBOM | Not started | |

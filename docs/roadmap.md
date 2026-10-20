@@ -75,13 +75,31 @@ Remaining from phase 3:
   reference PC.
 - [ ] Drag and drop out of the result list.
 
-## Phase 4: viewer, content and deep search
+## Phase 4: viewer, content and deep search — done (pending hardware validation)
 
-1. Preview host process with limits, generation-tagged requests and a cache
-   (ADR-009), with backends added incrementally.
-2. Selective content index with exclusions and explicit extraction states.
-3. Bounded, cancellable deep-search fallback for unindexed scopes.
-4. Archive-bomb, malformed-file and rapid-selection tests.
+Done (see requirements.md for evidence):
+
+- [x] Preview helper process (`flint-preview-host`), ADR-016:
+  * timeout kill, restart with backoff, Job Object memory limit
+  * generation-tagged latest-wins scheduler, bounded identity-keyed cache
+  * backends: text, HTML, Office/ODF/EPUB text, ZIP listing, image
+    info/thumbnail, hex
+- [x] Viewer pane: off by default, F9; no helper while it is off or the
+  launcher is hidden.
+- [x] Selective content index, ADR-017: opt-in, FTS5, explicit extraction
+  states, sensitive-location exclusions, governed background sync,
+  `content:` filter.
+- [x] Deep search, ADR-018: F4, bounded and cancellable, never enters
+  excluded locations.
+- [x] Archive-bomb, malformed-file and rapid-selection tests.
+
+Remaining from phase 4:
+
+- [ ] PDF text and preview (PDFium in the helper), WIC image decoding,
+  opt-in Office preview handlers, media, OCR (ADR-009 candidates).
+- [ ] Validate on Windows: shell thumbnails, the Job Object memory limit,
+  and `preview_probe.exe` on real files.
+- [ ] Deep search inside `path:` scopes that lie outside the index.
 
 ## Phase 5: plugins, diagnostics, release
 
