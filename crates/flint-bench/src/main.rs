@@ -125,8 +125,11 @@ fn engine_bench(args: &[String]) {
     }
     let rss0 = rss_kb();
     let t0 = Instant::now();
-    let t = corpus::build(n, seed);
+    let mut t = corpus::build(n, seed);
     let build = t0.elapsed();
+    let grown = t.heap_bytes();
+    t.shrink_to_fit();
+    println!("table: {:.1} MB as grown, {:.1} MB after shrink_to_fit ({:.1} bytes/entry incl. names; fixed columns {} B)", grown as f64 / 1e6, t.heap_bytes() as f64 / 1e6, t.heap_bytes() as f64 / t.len() as f64, flint_fuzzy::table::NameTable::SLOT_BYTES);
     let t1 = Instant::now();
     let _ = t.chain_masks();
     let chain = t1.elapsed();

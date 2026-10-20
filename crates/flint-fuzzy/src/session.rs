@@ -8,7 +8,7 @@
 //! history is off by default and lives elsewhere if enabled).
 
 use crate::engine::{search, CancelToken, Options, SearchResult};
-use crate::query::parse;
+use crate::query::{parse_with, Clock, UtcOffset};
 use crate::table::NameTable;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
@@ -48,7 +48,14 @@ const CACHE_SLOTS: usize = 16;
 
 impl Session {
     /// `sink` is called on the worker thread; it should post to the UI thread.
+    /// Dates in queries are interpreted in UTC.
     pub fn new(table: Arc<RwLock<NameTable>>, debounce: Duration, sink: impl Fn(Event) + Send + 'static) -> Self {
+        Self::with_time_zone(table, debounce, Arc::new(|_| 0), sink)
+    }
+
+    /// Like [`new`](Self::new), with dates in queries interpreted in the
+    /// zone given by `offset` (normally the user's local zone).
+    pub fn with_time_zone(table: Arc<RwLock<NameTable>>, debounce: Duration, offset: Arc<UtcOffset>, sink: impl Fn(Event) + Send + 'static) -> Self {
         let (tx, rx) = channel::<Msg>();
         let latest = Arc::new(AtomicU64::new(0));
         let inflight = Arc::new(Mutex::new(CancelToken::new()));
@@ -56,7 +63,9 @@ impl Session {
         let worker = std::thread::Builder::new()
             .name("flint-search".into())
             .spawn(move || {
-                let mut cache: Vec<((String, Options, u64), SearchResult)> = Vec::new();
+                // Keyed by text, options, table generation and the hour, so
+                // relative dates ("today") never outlive their meaning.
+                let mut cache: Vec<((String, Options, u64, i64), SearchResult)> = Vec::new();
                 let mut pending: Option<Msg> = None;
                 loop {
                     let msg = match pending.take() {
@@ -90,7 +99,8 @@ impl Session {
                     }
                     let cancel = inflight_w.lock().unwrap().clone();
                     let t = table.read().unwrap();
-                    let key = (raw.clone(), opts.clone(), t.generation());
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+                    let key = (raw.clone(), opts.clone(), t.generation(), now / 3600);
                     if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
                         let entry = cache.remove(pos);
                         let result = entry.1.clone();
@@ -98,8 +108,7 @@ impl Session {
                         sink(Event::Final { generation, result, cached: true });
                         continue;
                     }
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-                    let q = parse(&raw, now);
+                    let q = parse_with(&raw, &Clock { now, offset: &*offset });
                     let result = search(&t, &q, &opts, &cancel, |partial| {
                         if latest_w.load(Ordering::SeqCst) == generation {
                             sink(Event::Partial { generation, result: partial.clone() });
