@@ -11,7 +11,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Same version as rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: x86_64-pc-windows-gnu
           components: clippy
@@ -25,12 +26,16 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: x86_64-pc-windows-gnu
       - run: cargo test --workspace --locked --no-fail-fast
   licenses:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: taiki-e/install-action@v2
         with:
-          command: check licenses
+          tool: cargo-deny
+      - run: cargo deny --locked check licenses

@@ -655,6 +655,10 @@ guide: [plugins.md](plugins.md).
   long-path awareness, UTF-8 code page and asInvoker, and adds version
   info.
 * **Reproducible builds** (`tools/release.sh`):
+  * the toolchain is pinned in `rust-toolchain.toml` (Rust 1.97.0), and CI
+    and the release workflow install that exact version, so a new stable
+    Rust can neither change release bytes nor break CI with new lints;
+    bumping it is a deliberate change
   * flags: `--locked`, remapped path prefixes, no PE timestamp,
     `SOURCE_DATE_EPOCH` for archives
   * `--check-repro` builds twice in different directories; the three

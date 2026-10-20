@@ -136,7 +136,7 @@ pub fn decode(bytes: &[u8], cut: bool) -> (String, &'static str) {
     }
     for (bom, le, name) in [(&[0xFF, 0xFE][..], true, "UTF-16 LE"), (&[0xFE, 0xFF][..], false, "UTF-16 BE")] {
         if let Some(b) = bytes.strip_prefix(bom) {
-            let units: Vec<u16> = b.chunks_exact(2).map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }).collect();
+            let units: Vec<u16> = (0..b.len() / 2).map(|i| [b[2 * i], b[2 * i + 1]]).map(|c| if le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) }).collect();
             return (String::from_utf16_lossy(&units), name);
         }
     }

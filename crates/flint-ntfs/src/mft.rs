@@ -148,7 +148,7 @@ pub fn parse_record(rec: &mut [u8], segment: u64, sector: usize) -> Result<Optio
                 let n = *v.get(0x40).ok_or(MftError::BadAttribute { offset: off })? as usize;
                 let ns = *v.get(0x41).ok_or(MftError::BadAttribute { offset: off })?;
                 let raw = v.get(0x42..0x42 + 2 * n).ok_or(MftError::BadAttribute { offset: off })?;
-                let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                let units: Vec<u16> = (0..raw.len() / 2).map(|i| u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]])).collect();
                 e.names.push(MftName { parent, name: String::from_utf16_lossy(&units), namespace: ns });
             }
             ATTR_DATA if name_len == 0 => {

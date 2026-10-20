@@ -231,7 +231,7 @@ pub fn parse_notify_buffer(b: &[u8]) -> Vec<(u32, PathBuf)> {
         let act = u32::from_le_bytes(h[4..8].try_into().unwrap());
         let len = u32::from_le_bytes(h[8..12].try_into().unwrap()) as usize;
         let Some(name) = b.get(off + 12..off + 12 + len).filter(|_| len.is_multiple_of(2)) else { break };
-        let units: Vec<u16> = name.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = (0..name.len() / 2).map(|i| u16::from_le_bytes([name[2 * i], name[2 * i + 1]])).collect();
         out.push((act, PathBuf::from(String::from_utf16_lossy(&units).replace('\\', "/"))));
         if next == 0 {
             break;

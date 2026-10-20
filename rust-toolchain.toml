@@ -1,0 +1,8 @@
+# Pinned so CI, local and release builds use the same compiler and lints
+# (reproducible builds need the same toolchain; a new stable release must
+# not break CI). Bump deliberately, then fix any new lints.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-gnu"]
+profile = "minimal"

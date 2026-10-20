@@ -87,7 +87,7 @@ pub fn parse_record(b: &[u8], offset: usize) -> Result<(Parsed, usize), ParseErr
     if nl % 2 != 0 || no + nl > rec.len() || no < if major == 2 { 60 } else { 76 } {
         return Err(ParseError::BadName { offset });
     }
-    let units: Vec<u16> = rec[no..no + nl].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = (0..nl / 2).map(|i| u16::from_le_bytes([rec[no + 2 * i], rec[no + 2 * i + 1]])).collect();
     let (name, lossy_name) = match String::from_utf16(&units) {
         Ok(s) => (s, false),
         Err(_) => (String::from_utf16_lossy(&units), true),
