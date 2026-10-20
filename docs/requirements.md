@@ -144,4 +144,4 @@ Legend:
 | Archive attacks | Tested | Ratio, total-size and overlapping-entry zip bombs detected and never inflated; Office part bombs refused; nested archives never opened |
 | Plugin failures | Tested | Crash, hang, garbage, oversized frame, wrong id, flood, API mismatch, repeated failure; the launcher and other plugins keep working |
 | Reproducible benchmarks with recorded conditions | Tested | `bench/results/` |
-| Signed releases, reproducible builds, SBOM | Partial | `tools/release.sh`: executables byte-reproducible (`--check-repro`, verified here), CycloneDX SBOMs, notices, license gate (`cargo deny`), checksums, update manifest; CI release workflow written but not yet run on GitHub. Authenticode and update signing wait on owner decisions |
+| Signed releases, reproducible builds, SBOM | Partial | `tools/release.sh`: executables byte-reproducible (`--check-repro`, verified here), CycloneDX SBOMs, notices, license gate (`cargo deny`), checksums, update manifest; CI passes on GitHub (Linux and native Windows); the release workflow has not run yet. Authenticode and update signing wait on owner decisions |

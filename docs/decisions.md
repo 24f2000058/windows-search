@@ -678,7 +678,9 @@ guide: [plugins.md](plugins.md).
   * tests and clippy on Linux and the Windows target
   * native Windows tests and the license gate
   * on `v*` tags, a reproducibility check and a draft GitHub release
-  * not yet run on GitHub: written and syntax-checked here
+  * CI passes on GitHub (Linux: 215 tests, clippy for both targets, Windows
+    cross-build; native Windows: 213 tests; license gate). The release
+    workflow has not run yet (it needs a `v*` tag)
 
 ## Open decisions needing the owner
 

@@ -125,8 +125,10 @@ Remaining:
 
 - [ ] Owner decisions: Authenticode signing service, update-signing key,
   final name (decisions.md).
-- [ ] Run the CI and release workflows on GitHub (written and
-  syntax-checked, not yet run).
+- [x] CI passes on GitHub: Linux tests, clippy for both targets, the Windows
+  cross-build, native Windows tests and the license gate.
+- [ ] Run the release workflow (needs a `v*` tag; artifacts stay unsigned
+  until the signing decisions are made).
 - [ ] Validate on Windows hardware:
   * low-integrity plugin launch and the Job Object CPU cap (the
     child-process limit is verified in native Windows CI)

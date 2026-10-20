@@ -10,7 +10,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Same version as rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
@@ -25,7 +25,7 @@ jobs:
     # Native Windows: the Win32 code paths that Linux and Wine cannot prove.
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: x86_64-pc-windows-gnu
@@ -33,7 +33,7 @@ jobs:
   licenses:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: taiki-e/install-action@v2
         with:
