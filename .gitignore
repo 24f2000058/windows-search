@@ -3,3 +3,5 @@
 *.db-wal
 *.db-shm
 /bench/out/
+/dist
+*.cdx.json

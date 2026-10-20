@@ -4,6 +4,28 @@
 use flint_fuzzy::engine::{Hit, SearchResult, Status, Stop};
 use flint_fuzzy::table::EntryId;
 
+/// What Enter does on a non-file row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowAction {
+    /// A plugin result (performed only within the plugin's permissions).
+    Plugin { plugin: String, action: flint_plugin::protocol::ItemAction },
+    /// Review and approve the discovered plugin at this index.
+    Approve(usize),
+    /// Show details for the discovered plugin at this index.
+    About(usize),
+    None,
+}
+
+/// A list row that is not a file: plugin results and plugin management.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub title: String,
+    pub subtitle: String,
+    /// Who produced it (plugin name), shown in the last column.
+    pub source: String,
+    pub action: RowAction,
+}
+
 #[derive(Default)]
 pub struct ResultsModel {
     pub hits: Vec<Hit>,
@@ -11,9 +33,27 @@ pub struct ResultsModel {
     /// Generation of the displayed results.
     pub generation: u64,
     pub selected: Option<usize>,
+    /// When non-empty, the list shows these instead of `hits`.
+    pub rows: Vec<Row>,
 }
 
 impl ResultsModel {
+    pub fn len(&self) -> usize {
+        if self.rows.is_empty() { self.hits.len() } else { self.rows.len() }
+    }
+
+    /// Shows non-file rows (file results and their status are cleared).
+    pub fn show_rows(&mut self, rows: Vec<Row>) {
+        self.hits.clear();
+        self.status = None;
+        self.selected = (!rows.is_empty()).then_some(0);
+        self.rows = rows;
+    }
+
+    pub fn selected_row(&self) -> Option<&Row> {
+        self.selected.and_then(|i| self.rows.get(i))
+    }
+
     pub fn selected_id(&self) -> Option<EntryId> {
         self.selected.and_then(|i| self.hits.get(i)).map(|h| h.id)
     }
@@ -27,6 +67,7 @@ impl ResultsModel {
         }
         let keep = if generation == self.generation { self.selected_id() } else { None };
         self.generation = generation;
+        self.rows.clear();
         self.hits = r.hits.clone();
         self.status = Some(r.status.clone());
         self.selected = match keep.and_then(|id| self.hits.iter().position(|h| h.id == id)) {
@@ -38,12 +79,13 @@ impl ResultsModel {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.hits.is_empty() {
+        let n = self.len();
+        if n == 0 {
             self.selected = None;
             return;
         }
         let cur = self.selected.unwrap_or(0) as isize;
-        self.selected = Some((cur + delta).clamp(0, self.hits.len() as isize - 1) as usize);
+        self.selected = Some((cur + delta).clamp(0, n as isize - 1) as usize);
     }
 }
 
@@ -99,14 +141,24 @@ pub fn status_line(s: &Status, shown: usize, cov: &Coverage, deeper: Option<crat
     parts.join(" · ")
 }
 
+/// The most recent [`LatencyStats::KEEP`] samples (bounded: the launcher
+/// runs for weeks).
 #[derive(Default)]
 pub struct LatencyStats {
     samples: Vec<f64>,
+    next: usize,
 }
 
 impl LatencyStats {
+    pub const KEEP: usize = 1024;
+
     pub fn record(&mut self, ms: f64) {
-        self.samples.push(ms);
+        if self.samples.len() < Self::KEEP {
+            self.samples.push(ms);
+        } else {
+            self.samples[self.next] = ms;
+        }
+        self.next = (self.next + 1) % Self::KEEP;
     }
     pub fn summary(&self) -> Option<(usize, f64, f64, f64)> {
         if self.samples.is_empty() {
@@ -265,5 +317,27 @@ mod options_tests {
     #[test]
     fn defaults_match_engine_defaults() {
         assert_eq!(super::search_options(&flint_config::Search::default()), flint_fuzzy::engine::Options::default());
+    }
+
+    #[test]
+    fn rows_replace_hits_until_the_next_search() {
+        let mut m = super::ResultsModel::default();
+        let row = |t: &str| super::Row { title: t.into(), subtitle: String::new(), source: "p".into(), action: super::RowAction::None };
+        m.show_rows(vec![row("a"), row("b")]);
+        m.move_selection(5);
+        assert_eq!((m.len(), m.selected_row().map(|r| r.title.as_str())), (2, Some("b")));
+        assert_eq!(m.selected_id(), None, "rows are never file entries");
+        m.show_rows(Vec::new());
+        assert_eq!((m.len(), m.selected), (0, None));
+    }
+
+    #[test]
+    fn latency_samples_are_bounded() {
+        let mut l = super::LatencyStats::default();
+        for i in 0..5000 {
+            l.record(i as f64);
+        }
+        let (n, _, _, max) = l.summary().unwrap();
+        assert_eq!((n, max), (super::LatencyStats::KEEP, 4999.0));
     }
 }

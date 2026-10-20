@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 pub use hotkey::Hotkey;
 
-pub const CONFIG_VERSION: i64 = 1;
+pub const CONFIG_VERSION: i64 = 2;
 pub const PORTABLE_MARKER: &str = "portable.marker";
 pub const APP_DIR: &str = "Flint";
 
@@ -43,8 +43,11 @@ pub enum FuzzyIntensity {
 #[serde(rename_all = "lowercase")]
 pub enum UpdateMode {
     Off,
-    /// Check and notify; downloading/installing always needs approval.
+    /// Only when asked (`/update`); the network is never contacted otherwise.
     #[default]
+    Manual,
+    /// Also check at most every `check_interval_hours` and say so in the
+    /// status line. Downloading and installing always need approval.
     Notify,
 }
 
@@ -216,10 +219,19 @@ impl Default for Privacy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Updates {
     pub mode: UpdateMode,
+    /// Signed update manifest (`<url>.sig` holds its signature).
+    pub manifest_url: String,
+    pub check_interval_hours: u64,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Updates { mode: UpdateMode::Manual, manifest_url: "https://github.com/24f2000058/windows-search/releases/latest/download/update.json".into(), check_interval_hours: 24 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -324,7 +336,19 @@ type Migration = fn(&mut toml::Table);
 
 /// Ordered migrations: entry `i` upgrades version `i` to `i + 1`.
 /// v0 = file without a `version` key (treated as the v1 layout).
-const MIGRATIONS: &[Migration] = &[|_| {}];
+const MIGRATIONS: &[Migration] = &[
+    |_| {},
+    // v1 -> v2: `updates.mode = "notify"` was the written default before any
+    // update code existed, never a user choice; the new default is "manual"
+    // (no network contact unless asked).
+    |t| {
+        if let Some(u) = t.get_mut("updates").and_then(|u| u.as_table_mut()) {
+            if u.get("mode").and_then(|m| m.as_str()) == Some("notify") {
+                u.insert("mode".into(), "manual".into());
+            }
+        }
+    },
+];
 
 fn migrate_with(t: &mut toml::Table, from: i64, migrations: &[Migration]) -> i64 {
     let mut v = from.max(0);
@@ -533,6 +557,45 @@ pub fn resolve_paths(exe_dir: &Path, local_app_data: Option<&Path>) -> Result<Pa
     })
 }
 
+/// Rebuildable data: the index, snapshots, content index, downloaded
+/// updates and logs. `all` also removes settings, plugins and approvals,
+/// i.e. the whole data folder. Used by `flint --cleanup-data [--all]`,
+/// which the uninstaller runs. Refuses any folder that is not a Flint data
+/// folder, so a bad path can never delete anything else.
+pub fn cleanup_data(paths: &Paths, all: bool) -> Result<Vec<PathBuf>, String> {
+    let name = paths.data_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let expected = if paths.portable { "data" } else { APP_DIR };
+    if name != expected || paths.data_dir.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return Err(format!("{} is not a Flint data folder; nothing removed", paths.data_dir.display()));
+    }
+    if !paths.data_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let targets: Vec<PathBuf> = if all {
+        vec![paths.data_dir.clone()]
+    } else {
+        let mut v = Vec::new();
+        for f in ["index.db", "content.db"] {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                v.push(paths.data_dir.join(format!("{f}{suffix}")));
+            }
+        }
+        v.extend([paths.snapshots.clone(), paths.logs.clone(), paths.data_dir.join("updates"), paths.data_dir.join("update-state.toml")]);
+        v
+    };
+    let mut removed = Vec::new();
+    for t in targets {
+        let r = match std::fs::symlink_metadata(&t) {
+            Err(_) => continue,
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&t),
+            Ok(_) => std::fs::remove_file(&t),
+        };
+        r.map_err(|e| format!("{}: {e}", t.display()))?;
+        removed.push(t);
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +716,38 @@ mod tests {
         assert!(p.portable);
         assert_eq!(p.index_db, d.path().join("data").join("index.db"));
         assert!(resolve_paths(&d.path().join("nowhere"), None).is_err());
+    }
+
+    #[test]
+    fn v1_notify_default_becomes_manual() {
+        let d = dir();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "version = 1\n[updates]\nmode = \"notify\"\n").unwrap();
+        let l = load(&p);
+        assert_eq!(l.config.updates.mode, UpdateMode::Manual);
+        assert_eq!(l.config.version, 2);
+        std::fs::write(&p, "version = 2\n[updates]\nmode = \"notify\"\n").unwrap();
+        assert_eq!(load(&p).config.updates.mode, UpdateMode::Notify, "a v2 choice is kept");
+    }
+
+    #[test]
+    fn cleanup_removes_caches_or_everything_and_nothing_else() {
+        let d = dir();
+        let lad = d.path().join("lad");
+        let p = resolve_paths(d.path(), Some(&lad)).unwrap();
+        std::fs::create_dir_all(p.snapshots.clone()).unwrap();
+        std::fs::create_dir_all(p.data_dir.join("plugins").join("x")).unwrap();
+        for f in ["index.db", "index.db-wal", "content.db", "config.toml", "plugin-approvals.toml"] {
+            std::fs::write(p.data_dir.join(f), "x").unwrap();
+        }
+        std::fs::write(lad.join("neighbour.txt"), "keep").unwrap();
+        let removed = cleanup_data(&p, false).unwrap();
+        assert_eq!(removed.len(), 4);
+        assert!(p.config.exists() && p.data_dir.join("plugins").exists() && !p.index_db.exists() && !p.snapshots.exists());
+        cleanup_data(&p, true).unwrap();
+        assert!(!p.data_dir.exists() && lad.join("neighbour.txt").exists());
+        // Anything that is not a Flint data folder is refused.
+        let bogus = Paths { data_dir: lad.clone(), ..p.clone() };
+        assert!(cleanup_data(&bogus, true).is_err() && lad.exists());
     }
 }

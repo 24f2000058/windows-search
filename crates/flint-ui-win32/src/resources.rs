@@ -44,3 +44,25 @@ pub fn local_offset(utc: i64) -> i64 {
         secs(&sl) - secs(&su)
     }
 }
+
+fn reg_string(name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let key: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\0".encode_utf16().collect();
+    let val: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = [0u16; 256];
+    let mut len = (buf.len() * 2) as u32;
+    let r = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), val.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut len) };
+    (r == 0).then(|| String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]))
+}
+
+/// e.g. "Windows 11 Pro (23H2, build 22631)". The registry's product name
+/// still says "Windows 10" on Windows 11, so the build number decides.
+pub fn os_version() -> String {
+    let build = reg_string("CurrentBuild").unwrap_or_default();
+    let mut name = reg_string("ProductName").unwrap_or_else(|| "Windows".into());
+    if build.parse::<u32>().is_ok_and(|b| b >= 22000) {
+        name = name.replace("Windows 10", "Windows 11");
+    }
+    let display = reg_string("DisplayVersion").unwrap_or_default();
+    format!("{name} ({}build {build})", if display.is_empty() { String::new() } else { format!("{display}, ") })
+}

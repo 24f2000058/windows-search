@@ -369,6 +369,13 @@ pub fn context_menu(s: &State, at: POINT, extended: bool) {
         }
         items.push((a.id(), (*label).to_owned(), enabled(*a)));
     }
+    // Approved plugins' result actions (they receive the selected paths
+    // only with the selection_paths permission).
+    let plugin_items = s.plugins.menu_items();
+    if !plugin_items.is_empty() {
+        items.push((0, String::new(), true));
+        items.extend(plugin_items);
+    }
     // The native menu acts on whatever is at the path now, so it is only
     // offered for entries that still match the index.
     let native: Vec<String> = ts.iter().filter(|t| check(t, WinProbe.stat(&t.path)).is_ok()).map(|t| t.path.clone()).collect();
@@ -378,6 +385,11 @@ pub fn context_menu(s: &State, at: POINT, extended: bool) {
         shell::context_menu(raw(s.hwnd), &native, &items, at.x, at.y, extended)
     };
     match choice {
+        Ok(MenuChoice::Custom(id)) if id >= crate::plugins::FIRST_MENU_ID => {
+            // Revalidated like any other action: only entries still on disk.
+            let paths: Vec<String> = ts.iter().filter(|t| check(t, WinProbe.stat(&t.path)).is_ok()).map(|t| t.path.clone()).collect();
+            crate::plugins::run_menu_action(s, id, paths);
+        }
         Ok(MenuChoice::Custom(id)) => {
             if let Some(a) = Act::from_id(id) {
                 run(s, a);

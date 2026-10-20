@@ -27,7 +27,7 @@ use crate::model::{search_options, status_line, Coverage, LatencyStats, Palette,
 use crate::ux::{deeper_action, deeper_options, format_size, format_time, match_label, FilterChoice};
 use flint_config::Theme;
 use flint_index::catalog::{Catalog, CatalogOptions};
-use flint_commands::{websearch, Action, Registry};
+use flint_commands::{websearch, Action, AppAction, Registry};
 use flint_fuzzy::engine::{highlight, Options};
 use flint_fuzzy::table::flags;
 use flint_fuzzy::query::{parse_with, Clock, UtcOffset};
@@ -57,6 +57,12 @@ const WM_APP_NOTICE: u32 = WM_APP + 3;
 pub(crate) const WM_APP_PREVIEW: u32 = WM_APP + 4;
 /// A deep search finished; lParam is a `Box<DeepDone>`.
 const WM_APP_DEEP: u32 = WM_APP + 5;
+/// A plugin answered; lParam is a `Box<flint_plugin::service::Delivery>`.
+pub(crate) const WM_APP_PLUGIN: u32 = WM_APP + 6;
+/// An update check or download finished; lParam is a `Box<UpdateEvent>`.
+pub(crate) const WM_APP_UPDATE: u32 = WM_APP + 7;
+/// Notify-mode update checks (the interval itself is in the check state).
+const UPDATE_TIMER: usize = 8;
 const ID_PANE: isize = 120;
 const ID_EDIT: isize = 100;
 const ID_LIST: isize = 101;
@@ -98,7 +104,7 @@ pub(crate) struct State {
     freq: f64,
     pub(crate) model: RefCell<ResultsModel>,
     query_text: RefCell<String>,
-    command_line: RefCell<String>,
+    pub(crate) command_line: RefCell<String>,
     pub(crate) fonts: Cell<(HFONT, HFONT)>,
     pub(crate) dpi: Cell<u32>,
     t_hotkey: Cell<Option<i64>>,
@@ -107,7 +113,7 @@ pub(crate) struct State {
     key_stats: RefCell<LatencyStats>,
     disp_buf: RefCell<Vec<u16>>,
     /// `--selftest`: queries typed programmatically, one per timer tick.
-    selftest: Vec<String>,
+    pub(crate) selftest: Vec<String>,
     selftest_pos: Cell<usize>,
     /// None in `--synthetic` mode.
     pub(crate) catalog: Option<Arc<Catalog>>,
@@ -138,6 +144,7 @@ pub(crate) struct State {
     mono_font: HFONT,
     /// Background content indexing (privacy.content_indexing).
     content_service: RefCell<Option<flint_index::content::ContentService>>,
+    content_index: Option<Arc<flint_index::content::ContentIndex>>,
     /// Mounted volumes skipped by settings (deep-search scopes).
     deep_scopes: Arc<Mutex<Vec<String>>>,
     deep_cancel: RefCell<Arc<std::sync::atomic::AtomicBool>>,
@@ -151,7 +158,19 @@ pub(crate) struct State {
     brushes: Cell<(HBRUSH, HBRUSH)>,
     icons: RefCell<Icons>,
     /// Config/indexing messages shown until the user types.
-    notice: RefCell<String>,
+    pub(crate) notice: RefCell<String>,
+    pub(crate) plugins: crate::plugins::Plugins,
+    pub(crate) updates_cfg: flint_config::Updates,
+    /// Last update-check outcome (diagnostics).
+    pub(crate) update_status: RefCell<String>,
+    pub(crate) data_dir: std::path::PathBuf,
+    pub(crate) portable: bool,
+    pub(crate) redact_diagnostics: bool,
+    started: std::time::Instant,
+    /// A command or plugin owns the input: file-search events are ignored.
+    claimed: Cell<bool>,
+    /// Startup problems (diagnostics).
+    startup_notes: Vec<String>,
 }
 
 /// Marks a dialog/menu as open for its lifetime (see `State::modal`).
@@ -256,7 +275,7 @@ thread_local! {
     static STATE: RefCell<Option<Rc<State>>> = const { RefCell::new(None) };
 }
 
-fn state() -> Option<Rc<State>> {
+pub(crate) fn state() -> Option<Rc<State>> {
     STATE.with(|s| s.borrow().clone())
 }
 
@@ -479,6 +498,8 @@ fn hide(s: &State) {
     unsafe { ShowWindow(s.hwnd, SW_HIDE) };
     // No helper process while hidden (it restarts on the next preview).
     crate::pane::stop(s);
+    // Plugin processes too (they restart when next used).
+    s.plugins.stop();
     clear_deep(s);
     // Release derived search caches while idle; history is never stored.
     s.table.read().unwrap().trim_caches();
@@ -525,9 +546,15 @@ fn run_query(s: &State, text: String) {
     if let (Some(c), true) = (&s.catalog, s.indexing.pause_while_typing) {
         c.governor().note_user_activity();
     }
-    if cmds.first().is_some_and(|c| c.exclusive) {
-        // `/s` claims the input; no file search runs for it.
-        *s.model.borrow_mut() = ResultsModel::default();
+    let plugin = !cmds.first().is_some_and(|c| c.exclusive) && crate::plugins::route(s, &text);
+    s.claimed.set(plugin || cmds.first().is_some_and(|c| c.exclusive));
+    if s.claimed.get() {
+        // `/s`, `/diag`… and plugin prefixes claim the input; no file
+        // search runs for them.
+        if !plugin {
+            s.plugins.showing.borrow_mut().take();
+            *s.model.borrow_mut() = ResultsModel::default();
+        }
         // Advance the generation so an in-flight file search is canceled and
         // its late results are rejected as stale.
         let g = s.session.submit("", s.opts.borrow().clone());
@@ -541,10 +568,26 @@ fn run_query(s: &State, text: String) {
     s.t_key.set(Some((generation, qpc())));
 }
 
+/// Re-reads the model into the list (row count, selection, repaint).
+pub(crate) fn refresh_list(s: &State) {
+    set_count(s);
+    unsafe { InvalidateRect(s.hwnd, null(), 0) };
+}
+
+/// Replaces the search text (re-runs the query through EN_CHANGE).
+pub(crate) fn set_query(s: &State, text: &str) {
+    let w = wide(text);
+    unsafe {
+        SetWindowTextW(s.edit, w.as_ptr());
+        SetFocus(s.edit);
+        SendMessageW(s.edit, EM_SETSEL, w.len() - 1, (w.len() - 1) as LPARAM);
+    }
+}
+
 fn set_count(s: &State) {
     let (len, selected) = {
         let m = s.model.borrow();
-        (m.hits.len(), m.selected)
+        (m.len(), m.selected)
     };
     unsafe {
         SendMessageW(s.list, LVM_SETITEMCOUNT, len, (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as LPARAM);
@@ -600,6 +643,9 @@ fn cell_text(s: &State, t: &NameTable, hit: &flint_fuzzy::engine::Hit, col: i32)
 }
 
 fn on_event(s: &State, ev: Event) {
+    if s.claimed.get() {
+        return; // the (empty) search that canceled the previous one
+    }
     let latest = s.latest.load(Ordering::SeqCst);
     let (generation, result, is_final) = match ev {
         Event::Partial { generation, result } => (generation, result, false),
@@ -625,9 +671,19 @@ fn on_event(s: &State, ev: Event) {
 }
 
 fn activate_selected(s: &State) {
+    let row = s.model.borrow().selected_row().cloned();
+    if let Some(row) = row {
+        return crate::plugins::activate(s, &row);
+    }
     let text = s.query_text.borrow().clone();
     let cmds = s.commands.evaluate(&text);
     if let Some(c) = cmds.first().filter(|c| c.exclusive) {
+        match c.action {
+            Action::App(AppAction::Diagnostics) => return crate::diagview::open(s),
+            Action::App(AppAction::CheckUpdates) => return crate::updates::check(s, true),
+            Action::App(AppAction::Plugins) => return crate::plugins::list(s),
+            _ => {}
+        }
         if let Action::OpenUrl(url) = &c.action {
             // Re-validate immediately before handing anything to the shell.
             if websearch::is_safe_url(url) {
@@ -677,6 +733,9 @@ unsafe fn on_custom_draw(s: &State, cd: &mut NMLVCUSTOMDRAW) -> LRESULT {
         CDDS_ITEMPREPAINT => CDRF_NOTIFYSUBITEMDRAW as LRESULT,
         st if st == (CDDS_ITEMPREPAINT | CDDS_SUBITEM) => {
             let row = cd.nmcd.dwItemSpec;
+            if !s.model.borrow().rows.is_empty() {
+                return draw_row(s, cd, row);
+            }
             // Gather everything (and release borrows) before drawing.
             let (hit, selected) = {
                 let m = s.model.borrow();
@@ -743,6 +802,48 @@ unsafe fn on_custom_draw(s: &State, cd: &mut NMLVCUSTOMDRAW) -> LRESULT {
         }
         _ => CDRF_DODEFAULT as LRESULT,
     }
+}
+
+/// Text of a non-file row's cell.
+fn row_cell(r: &crate::model::Row, col: i32) -> &str {
+    match col {
+        0 => &r.title,
+        1 => &r.subtitle,
+        4 => &r.source,
+        _ => "",
+    }
+}
+
+/// Plugin and management rows: title, subtitle, source.
+unsafe fn draw_row(s: &State, cd: &mut NMLVCUSTOMDRAW, row: usize) -> LRESULT {
+    let (text, selected) = {
+        let m = s.model.borrow();
+        match m.rows.get(row) {
+            Some(r) => (row_cell(r, cd.iSubItem).to_owned(), m.selected == Some(row)),
+            None => return CDRF_DODEFAULT as LRESULT,
+        }
+    };
+    let mut rc: RECT = std::mem::zeroed();
+    rc.top = cd.iSubItem;
+    rc.left = LVIR_BOUNDS as i32;
+    SendMessageW(s.list, LVM_GETSUBITEMRECT, row, &mut rc as *mut _ as LPARAM);
+    if cd.iSubItem == 0 {
+        rc.right = rc.left + SendMessageW(s.list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
+    }
+    let p = s.palette.get();
+    let bg = CreateSolidBrush(if selected { p.sel_bg } else { p.bg });
+    FillRect(cd.nmcd.hdc, &rc, bg);
+    DeleteObject(bg);
+    let w: Vec<u16> = text.encode_utf16().collect();
+    if !w.is_empty() {
+        SelectObject(cd.nmcd.hdc, if cd.iSubItem == 0 { s.fonts.get().1 } else { s.fonts.get().0 });
+        SetBkMode(cd.nmcd.hdc, TRANSPARENT as i32);
+        SetTextColor(cd.nmcd.hdc, if selected { p.sel_text } else if cd.iSubItem == 0 { p.text } else { p.dim });
+        rc.left += scale(6, s.dpi.get());
+        rc.right -= scale(6, s.dpi.get());
+        DrawTextW(cd.nmcd.hdc, w.as_ptr(), w.len() as i32, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    CDRF_SKIPDEFAULT as LRESULT
 }
 
 fn key_down(vk: u16) -> bool {
@@ -912,10 +1013,13 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                     if di.item.mask & LVIF_TEXT != 0 && !di.item.pszText.is_null() {
                         let row = di.item.iItem as usize;
                         let hit = s.model.borrow().hits.get(row).copied();
-                        let text = hit.map(|h| {
-                            let t = s.table.read().unwrap();
-                            if t.is_live(h.id) { cell_text(s, &t, &h, di.item.iSubItem) } else { String::new() }
-                        });
+                        let text = match s.model.borrow().rows.get(row) {
+                            Some(r) => Some(row_cell(r, di.item.iSubItem).to_owned()),
+                            None => hit.map(|h| {
+                                let t = s.table.read().unwrap();
+                                if t.is_live(h.id) { cell_text(s, &t, &h, di.item.iSubItem) } else { String::new() }
+                            }),
+                        };
                         let mut buf = s.disp_buf.borrow_mut();
                         *buf = wide(&text.unwrap_or_default());
                         let max = (di.item.cchTextMax as usize).min(buf.len());
@@ -1035,6 +1139,8 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                     "{MENU}" => return { crate::actions::context_menu(s, crate::actions::menu_point_for_keyboard(s), false); 0 },
                     "{RENAME}" => return { crate::actions::run(s, Act::Rename); 0 },
                     "{COPYPATH}" => return { crate::actions::run(s, Act::CopyPath); 0 },
+                    "{ENTER}" => return { activate_selected(s); 0 },
+                    "{DOWN}" => return { s.model.borrow_mut().move_selection(1); set_count(s); 0 },
                     _ => {}
                 }
                 let mut acc = String::new();
@@ -1053,6 +1159,20 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 KillTimer(hwnd, SELFTEST_TIMER);
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
+            0
+        }
+        WM_APP_PLUGIN => {
+            let d = *Box::from_raw(lp as *mut flint_plugin::service::Delivery);
+            crate::plugins::on_delivery(s, d);
+            0
+        }
+        WM_APP_UPDATE => {
+            let ev = *Box::from_raw(lp as *mut crate::updates::UpdateEvent);
+            crate::updates::on_event(s, ev);
+            0
+        }
+        WM_TIMER if wp == UPDATE_TIMER => {
+            crate::updates::tick(s);
             0
         }
         WM_APP_PREVIEW => {
@@ -1171,6 +1291,69 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
     }
 }
 
+/// Everything `/diag` shows (no search text or result names).
+pub(crate) fn diag_snapshot(s: &State) -> crate::diag::Snapshot {
+    let (bytes, slack, entries) = {
+        let t = s.table.read().unwrap();
+        (t.heap_bytes(), t.slack_bytes(), t.live_count())
+    };
+    let mem = crate::resources::memory_usage();
+    let plugin_health = s.plugins.service.borrow().as_ref().map(|svc| svc.health()).unwrap_or_default();
+    let plugins = s
+        .plugins
+        .found
+        .borrow()
+        .iter()
+        .map(|(d, st)| {
+            let id = d.manifest.as_ref().map(|m| m.id.clone()).unwrap_or_default();
+            let h = plugin_health.iter().find(|(m, _)| m.id == id).map(|(_, h)| h.clone());
+            crate::diag::PluginLine {
+                label: d.label(),
+                folder: d.dir.display().to_string(),
+                standing: match st {
+                    flint_plugin::registry::Standing::Approved { .. } => "approved".into(),
+                    flint_plugin::registry::Standing::NeedsApproval { reason, .. } => format!("needs approval ({reason})"),
+                    flint_plugin::registry::Standing::Invalid(e) => format!("not loaded: {e}"),
+                },
+                isolation: h.as_ref().map_or("not started".into(), flint_plugin::service::isolation_of),
+                disabled: h.as_ref().and_then(|h| h.disabled.clone()),
+                stats: h.map(|h| h.stats),
+            }
+        })
+        .collect();
+    let viewer = Some(if s.viewer_on.get() { "on (the preview helper runs only while the launcher is shown)".to_owned() } else { "off: no file is read for previews".to_owned() });
+    crate::diag::Snapshot {
+        version: format!("{} ({})", env!("CARGO_PKG_VERSION"), option_env!("FLINT_BUILD_ID").unwrap_or("local build")),
+        os: crate::resources::os_version(),
+        portable: s.portable,
+        data_dir: s.data_dir.display().to_string(),
+        uptime_secs: s.started.elapsed().as_secs(),
+        private_bytes: mem.map(|m| m.0 as u64),
+        working_set: mem.map(|m| m.1 as u64),
+        entries,
+        table_bytes: bytes,
+        table_slack: slack,
+        governor: s.catalog.as_ref().map(|c| c.governor().stats()),
+        volumes: s.catalog.as_ref().map(|c| c.statuses()).unwrap_or_default(),
+        coverage: Some(coverage(s)),
+        latency: vec![("hotkey → window shown".into(), s.hotkey_stats.borrow().summary()), ("keystroke → results painted".into(), s.key_stats.borrow().summary())],
+        last_search: s.model.borrow().status.clone(),
+        content: s.content_index.as_ref().map(|c| c.stats()),
+        viewer,
+        plugins,
+        plugins_enabled: s.plugins.enabled,
+        update: format!("mode {:?}; {}", s.updates_cfg.mode, if s.update_status.borrow().is_empty() { "not checked this session".to_owned() } else { s.update_status.borrow().clone() }),
+        notices: s.startup_notes.iter().cloned().chain(s.plugins.notes.borrow().iter().cloned()).collect(),
+        errors: Vec::new(),
+    }
+}
+
+pub(crate) fn redactor(s: &State, enabled: bool) -> crate::diag::Redactor {
+    let env = |k: &str| std::env::var(k).ok();
+    let salt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) ^ (std::process::id() as u64) << 32 ^ s.hwnd as u64;
+    crate::diag::Redactor::new(enabled, salt, env("USERPROFILE").as_deref(), env("USERNAME").as_deref(), env("COMPUTERNAME").as_deref())
+}
+
 fn status_line_idle(cov: &Coverage) -> String {
     if cov.complete { "type to search".into() } else { format!("type to search · indexing: {}", cov.problems.join(", ")) }
 }
@@ -1200,6 +1383,25 @@ fn spawn_synthetic(table: Arc<RwLock<NameTable>>, coverage: Arc<Mutex<Coverage>>
     });
 }
 
+/// Asks a running launcher (this user's) to exit and waits up to 5 s.
+fn quit_running() -> bool {
+    let class = wide("FlintLauncher");
+    unsafe {
+        let h = FindWindowW(class.as_ptr(), null());
+        if h.is_null() {
+            return false;
+        }
+        PostMessageW(h, WM_CLOSE, 0, 0);
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if FindWindowW(class.as_ptr(), null()).is_null() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn run() {
     let t_start = qpc();
     let args: Vec<String> = std::env::args().collect();
@@ -1221,6 +1423,21 @@ pub fn run() {
             return;
         }
     };
+    // Installer hooks: stop a running launcher; remove data on uninstall.
+    if args.iter().any(|a| a == "--quit" || a == "--cleanup-data") {
+        let closed = quit_running();
+        println!("running launcher: {}", if closed { "closed" } else { "none" });
+        if args.iter().any(|a| a == "--cleanup-data") {
+            match flint_config::cleanup_data(&paths, args.iter().any(|a| a == "--all")) {
+                Ok(v) => println!("removed {} item(s) from {}", v.len(), paths.data_dir.display()),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
     let _ = std::fs::create_dir_all(&paths.data_dir);
     let loaded = flint_config::load(&paths.config);
     let cfg = loaded.config;
@@ -1411,6 +1628,7 @@ pub fn run() {
             host_exe,
             mono_font,
             content_service: RefCell::new(content_service),
+            content_index: content_index.clone(),
             deep_scopes: Arc::new(Mutex::new(Vec::new())),
             deep_cancel: RefCell::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             deep_cfg: cfg.deep_search.clone(),
@@ -1421,12 +1639,28 @@ pub fn run() {
             brushes: Cell::new((null_mut(), null_mut())),
             icons: RefCell::new(Icons::new()),
             notice: RefCell::new(String::new()),
+            plugins: crate::plugins::Plugins::new(cfg.plugins.enabled, &paths.data_dir),
+            updates_cfg: cfg.updates.clone(),
+            update_status: RefCell::new(String::new()),
+            data_dir: paths.data_dir.clone(),
+            portable: paths.portable,
+            redact_diagnostics: cfg.privacy.redact_diagnostics,
+            started: std::time::Instant::now(),
+            claimed: Cell::new(false),
+            startup_notes: notices.clone(),
         });
         layout(&state);
         fill_filters(&state);
         apply_palette(&state);
         resync_volumes(&state);
         STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
+        // Plugins are discovered (and hashed) now; none starts until used.
+        state.plugins.reload(hwnd);
+        notices.extend(state.plugins.notes.borrow().iter().cloned());
+        if cfg.updates.mode == flint_config::UpdateMode::Notify {
+            // No network at startup: the first check is a quarter hour in.
+            SetTimer(hwnd, UPDATE_TIMER, 15 * 60 * 1000, None);
+        }
 
         // The configured hotkey can be taken by another application (Ctrl+Space
         // often is, by IMEs on CJK systems): say so instead of doing nothing.

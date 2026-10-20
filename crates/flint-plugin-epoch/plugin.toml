@@ -1,0 +1,18 @@
+# Sample plugin manifest. Copy this folder (with the built
+# flint-plugin-epoch.exe) to <data dir>\plugins\epoch\ and approve it.
+api = 1
+id = "epoch"
+name = "Epoch converter"
+version = "0.1.0"
+description = "Converts between Unix timestamps and UTC dates; adds Copy SHA-256 for selected files."
+exe = "flint-plugin-epoch.exe"
+prefix = "epoch"
+permissions = ["selection_paths"]
+
+[[actions]]
+id = "sha256"
+title = "Copy SHA-256"
+
+[limits]
+timeout_ms = 3000
+memory_mb = 32

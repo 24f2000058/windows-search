@@ -1,0 +1,5 @@
+# Trusted update-signing keys, one per line: <key-id> <ed25519 public key, 64 hex chars>
+# Generated with `flint-release keygen`. Several lines allow key rotation.
+# The project has no release key yet (owner decision, see docs/decisions.md
+# ADR-020): until one is added here, a build can check for updates but will
+# not download or install anything, because nothing could be verified.

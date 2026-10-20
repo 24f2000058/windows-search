@@ -4,7 +4,8 @@ Flint (working name) is a keyboard-driven Windows launcher. It does indexed
 filesystem search with aggressive, progressive fuzzy matching, and keeps all
 processing local.
 
-**State: phase 4 of 5.** Open source under MIT OR Apache-2.0.
+**State: all five phases built; not yet validated on Windows hardware.**
+Open source under MIT OR Apache-2.0.
 
 * **Implemented and tested on Linux:**
   * the search engine, index persistence/recovery, multi-volume catalog,
@@ -14,15 +15,20 @@ processing local.
     fault-injection tests
   * isolated, bounded previews, the opt-in content index and deep search,
     with archive-bomb, malformed-file and rapid-selection tests
+  * the plugin host (approval, confinement, crash recovery), redacted
+    diagnostics, signed update checks, and the release pipeline
 * **Prototypes, not yet validated on Windows hardware:**
   * the Windows adapters (raw `$MFT` reader, USN journal,
     `ReadDirectoryChangesW`)
   * shell integration (`IFileOperation`, context menu, clipboard)
-  * the launcher UI
+  * the launcher UI, the `/diag` window, plugin confinement, WinHTTP
+  * the per-user MSI installer
 
   They are compile-checked and run end to end under Wine.
-* **Not started:** plugins, diagnostics view and packaging (phase 5).
-  PDF and media previews are not built yet.
+* **Not built:** PDF and media previews, a settings window.
+* **Waiting on owner decisions:** Authenticode signing and an
+  update-signing key. Until then artifacts are unsigned and builds never
+  install updates.
 
 The full status per requirement is in
 [docs/requirements.md](docs/requirements.md).
@@ -41,19 +47,24 @@ crates/flint-index      journal model, per-volume state machine, SQLite store, t
 crates/flint-ntfs       USN V2/V3 parser (fuzzed) + Win32 MFT/USN JournalSource + ntfs_probe example
 crates/flint-preview    isolated preview/extraction helper (flint-preview-host), backends, limits, scheduler
 crates/flint-ops        safe file operations (plan/revalidate/verify, compare, duplicates) + Windows shell integration
-crates/flint-commands   command registry, /s web search, safe calculator
+crates/flint-plugin     plugin host: manifests, approvals, JSON protocol, confinement, recovery
+crates/flint-plugin-epoch  sample plugin and protocol reference implementation
+crates/flint-update     signed update manifests, version policy, verified downloads, flint-release tool
+crates/flint-commands   command registry, /s web search, safe calculator, /diag /update /plugins
 crates/flint-config     versioned settings (TOML), migrations/recovery, data paths, hotkey parsing
 crates/flint-ui-win32   direct-Win32 launcher (virtual ListView, highlights, filter bar, file actions, timing)
 crates/flint-bench      reproducible benchmarks and synthetic corpus
 bench/cpp               C++ port of the hot kernels (Rust vs C++ comparison)
 bench/results           recorded benchmark runs with machine/toolchain details
+installer/              per-user MSI definition (WiX v3 schema, built with wixl)
+tools/release.sh        reproducible release build: MSI, portable zip, SBOM, notices, checksums
 docs/                   architecture, decisions (ADRs), requirements, benchmarks, roadmap, dependencies
 ```
 
 ## Build and test
 
 ```sh
-cargo test --release                       # 175 tests (Linux or Windows)
+cargo test --release                       # 214 tests (Linux or Windows)
 cargo build --release -p flint-bench
 ./target/release/flint-bench engine --n 1000000
 
@@ -63,6 +74,10 @@ cargo build --release --target x86_64-pc-windows-gnu -p flint-ui-win32
 cargo build --release --target x86_64-pc-windows-gnu -p flint-ntfs --example ntfs_probe
 cargo build --release --target x86_64-pc-windows-gnu -p flint-ops --example ops_probe
 cargo build --release --target x86_64-pc-windows-gnu -p flint-preview --bins --examples
+
+# Release artifacts (needs mingw-w64, wixl, cargo-cyclonedx, cargo-deny)
+tools/release.sh                # -> dist/<version>/
+tools/release.sh --check-repro  # build twice, compare executables
 ```
 
 ## Trying it on Windows
@@ -83,7 +98,11 @@ cargo build --release --target x86_64-pc-windows-gnu -p flint-preview --bins --e
   * `--root <folder>` indexes just one folder.
   * `--synthetic 1000000` uses an in-memory benchmark corpus.
   * `--selftest "q1|q2|{F3}"` types the queries automatically (`{F3}`,
-    `{MENU}`, `{RENAME}` and `{COPYPATH}` stand for shortcuts).
+    `{MENU}`, `{RENAME}`, `{COPYPATH}`, `{ENTER}` and `{DOWN}` stand for
+    keys; dialogs are printed and answered yes).
+  * `--quit` closes a running launcher. `--cleanup-data [--all]` removes
+    the index and caches (with `--all`, the whole data folder); the
+    uninstaller uses both.
 
   Press **Ctrl+Space** (configurable). Esc hides and Alt+F4 quits.
   Latencies, volume status and memory use are printed to the console.
@@ -128,6 +147,11 @@ Rows are labelled "fuzzy", "scattered", "weak: path", "weak: similar" or
   * `path:docs`
 * `/s query` searches the web (explicit only). `=1+2` or `2*(3+4)` uses the
   calculator.
+* `/diag` shows diagnostics, `/update` checks for updates, `/plugins`
+  lists plugins (press Enter).
+* `<plugin prefix> text` asks a plugin, for example `epoch 1700000000`.
+  Plugins are off by default (`plugins.enabled`); see
+  [docs/plugins.md](docs/plugins.md).
 * `content:word` or `content:"two words"` searches file contents. This
   needs `privacy.content_indexing = true` (off by default) and covers
   Documents and Desktop unless `content.roots` says otherwise. When off,
@@ -140,3 +164,4 @@ Rows are labelled "fuzzy", "scattered", "weak: path", "weak: similar" or
 * [benchmarks.md](docs/benchmarks.md): status against the targets and the
   reference-PC protocol.
 * [roadmap.md](docs/roadmap.md): phases 2–5.
+* [plugins.md](docs/plugins.md): writing a plugin (protocol API 1).

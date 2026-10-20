@@ -18,7 +18,7 @@ Legend:
 | Requirement | Status | Evidence / gap |
 |---|---|---|
 | Windows target | Prototype | Cross-built PE binaries; no Windows CI yet |
-| Installer + portable builds | Partial | Portable mode implemented and tested (`portable.marker` next to the exe → `<exe>\data\`, verified under Wine); installer and release packaging: phase 5 |
+| Installer + portable builds | Prototype | Per-user MSI (`installer/flint.wxs`): shortcut, optional autostart, upgrade, clean uninstall (`--quit`, `--cleanup-data`, `REMOVEDATA=1`), verified under Wine; deterministic portable zip; `cleanup_data` tested. Unsigned until a certificate is chosen (ADR-021) |
 | Ctrl+Space default, customizable | Prototype | Default Ctrl+Space; `general.hotkey` in config.toml, parsed/validated (reserved combos rejected, tested); a taken hotkey is reported in the UI. No settings window yet |
 | Compact live UI, icons, highlights, name + path, keyboard nav | Prototype | Live results with highlights, folder, size, local modified time and a match label; file-type icons (by type only — ADR-011); arrows/PgUp/PgDn, Shift+arrows multi-select, Tab to the filter bar, file-action shortcuts (README). Verified under Wine (`docs/img/phase3-*.png`) |
 | Themes, custom keybindings | Partial | Light/dark following the system setting or forced in config, high contrast uses system colors; both palettes pass WCAG AA (tested). In-app keybinding customization not started |
@@ -81,7 +81,7 @@ Legend:
 | Extensible registry | Tested | `Registry`, duplicate ids rejected |
 | `/s` explicit only, quotes preserved, safe encoding, default browser | Tested / Prototype | Encoding and template validation tested; `ShellExecuteW` after re-validation in the spike |
 | Calculator without evaluating code | Tested | Bounded recursive descent, fuzzed |
-| Plugin commands | Designed | ADR-008 |
+| Plugin commands | Prototype | Prefix-routed plugin results as rows; Enter performs the action within the plugin's permissions; verified under Wine with the sample plugin (ADR-019) |
 
 ## 5. Integrated viewer
 
@@ -109,19 +109,19 @@ Legend:
 
 | Requirement | Status |
 |---|---|
-| Versioned API, isolated helpers, permissions, approval, timeouts, recovery, limits, core survives failure | **Designed** (ADR-008) |
+| Versioned API, isolated helpers, permissions, approval, timeouts, recovery, limits, core survives failure | **Tested** (11 unit tests and 13 tests against a real plugin process, plus a Windows-only confined-spawn test run under Wine); low integrity and the job's child-process limit not enforced by Wine, so unverified on hardware (ADR-019, [plugins.md](plugins.md)) |
 
 ## 9. Privacy, security, resources
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
-| Local only, no telemetry | Tested by construction | No network code outside the explicit `/s` browser launch |
+| Local only, no telemetry | Tested by construction | Network is used only by the explicit `/s` browser launch and update checks (`/update`, or `updates.mode = "notify"`; default `manual`). Nothing is sent but the HTTP request for the manifest |
 | Search history off by default | Tested by construction | Session cache is in-memory only, cleared on hide |
 | Never execute input/files automatically | Prototype | Calculator does not evaluate code; files open only on explicit Enter/double-click/Open after revalidation; previews will never execute (phase 4) |
-| Bounded workloads | Partial | Search top-K, deadlines, calculator limits, parser bounds, one heavy scan at a time, compare/duplicate read budgets (`files.*_limit_mb`); preview/archive/plugin limits not built |
+| Bounded workloads | Partial | Search top-K, deadlines, calculator limits, parser bounds, one heavy scan at a time, compare/duplicate read budgets (`files.*_limit_mb`); preview and archive limits (phase 4); plugin time/memory/CPU/output limits |
 | Lazy init, bounded caches, no continuous rescans | Partial | Caches trimmed on hide; journal-driven updates; idle journal polls no longer write to disk (tested); traversal volumes watched instead of rescanned |
-| Redacted local diagnostics | Not started | |
-| Update notification, approval, integrity | Not started | |
+| Redacted local diagnostics | Tested | `/diag` window: copy/save exactly what is shown; redacted by default (profile, user, computer, path components hashed per report); no query text or result names; redactor tests; verified under Wine |
+| Update notification, approval, integrity | Tested (logic) / Prototype (WinHTTP) | ed25519-signed manifest, no rollback, size + SHA-256 verified download, approval before download and before install (ADR-020); 7 tests; WinHTTP path run under Wine against a local server. No release key yet, so no build installs updates |
 | Dependency/license records | Tested | `docs/dependencies.md` (generated) |
 
 ## 10. Configuration and diagnostics
@@ -130,7 +130,7 @@ Legend:
 |---|---|
 | Settings (hotkeys, themes, ranking, fuzzy intensity, exhaustive, scope, …) | Partial | `config.toml` covers hotkey, theme, search (intensity, best effort, exhaustive, limits, debounce, deadline), indexing scope (volumes, removable, network, exclusions, extra folders) and resource use (background priority, concurrent scans, pause while typing), file operations (collisions, recycle confirmation, compare/duplicate limits), viewer (limits, thumbnails, helper timeout/memory), content index (roots, extensions, exclusions, limits), deep search limits, web search, privacy, updates, plugins. **No settings window yet** |
 | Versioned config with migration/recovery | Tested | Versioned TOML, ordered migrations with backup, malformed file moved aside, per-section/per-value reset, newer-version files never overwritten, atomic saves (`flint-config`, 9 tests); index DB schema v1→v2 migration tested |
-| Per-volume status, USN checkpoints, recovery state, latency, fuzzy stage, failures, resources, plugin errors | Partial: data exists (`VolumeIndexer::stats/state`, `Status.stages`), not yet exposed in a diagnostics view |
+| Per-volume status, USN checkpoints, recovery state, latency, fuzzy stage, failures, resources, plugin errors | Prototype: `/diag` shows per-volume phase/state (journal id and next USN), load source, rescans, errors, unreadable folders, latency p50/p95, last search stages, memory, governor, content index, plugin health and isolation, update status |
 
 ## 11–12. Validation and engineering rules
 
@@ -142,6 +142,6 @@ Legend:
 | Malformed files, rapid preview changes | Tested | Malformed USN buffers fuzzed; every preview backend fed thousands of mutated/random inputs (no panics, bounded output); every truncation of protocol messages rejected; rapid selection (200 changes → 1 delivery, ≤2 previews) |
 | Destructive-operation races | Tested | `flint-ops` fault-injection tests (see section 6) |
 | Archive attacks | Tested | Ratio, total-size and overlapping-entry zip bombs detected and never inflated; Office part bombs refused; nested archives never opened |
-| Plugin failures | Not started | Phase 5 |
+| Plugin failures | Tested | Crash, hang, garbage, oversized frame, wrong id, flood, API mismatch, repeated failure; the launcher and other plugins keep working |
 | Reproducible benchmarks with recorded conditions | Tested | `bench/results/` |
-| Signed releases, reproducible builds, SBOM | Not started | |
+| Signed releases, reproducible builds, SBOM | Partial | `tools/release.sh`: executables byte-reproducible (`--check-repro`, verified here), CycloneDX SBOMs, notices, license gate (`cargo deny`), checksums, update manifest; CI release workflow written but not yet run on GitHub. Authenticode and update signing wait on owner decisions |
