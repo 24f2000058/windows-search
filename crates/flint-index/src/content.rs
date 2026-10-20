@@ -81,8 +81,25 @@ impl ContentConfig {
     }
 
     fn excluded(&self, folded_path: &str) -> bool {
-        SENSITIVE.iter().any(|s| folded_path.contains(s)) || self.excluded.iter().any(|e| folded_path.starts_with(&fold_str(e)))
+        is_excluded(folded_path, &self.excluded)
     }
+}
+
+/// Folded, `/`-separated, with a trailing `/`, so prefixes match whole
+/// components on any platform and with either separator.
+fn path_key(p: &str) -> String {
+    let mut k = fold_str(p).replace('\\', "/");
+    if !k.ends_with('/') {
+        k.push('/');
+    }
+    k
+}
+
+/// Inside a sensitive location or under one of `excluded` (whole path
+/// components: excluding `C:\data` does not exclude `C:\database`).
+pub fn is_excluded(path: &str, excluded: &[String]) -> bool {
+    let k = path_key(path);
+    SENSITIVE.iter().any(|s| k.contains(&s.replace('\\', "/"))) || excluded.iter().filter(|e| !e.trim().is_empty()).any(|e| k.starts_with(&path_key(e)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -443,6 +460,16 @@ impl Drop for ContentService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusions_match_whole_components_with_either_separator() {
+        let ex = vec!["C:\\Data".to_owned(), "/scope/private/".to_owned()];
+        assert!(is_excluded("c:\\data", &ex) && is_excluded("C:/DATA/x.txt", &ex) && is_excluded("C:\\Data\\sub", &ex));
+        assert!(!is_excluded("C:\\Database\\x", &ex), "a longer name is not inside the excluded folder");
+        assert!(is_excluded("/scope\\private", &ex) && is_excluded("/scope/private/diary.txt", &ex));
+        assert!(is_excluded("C:\\Users\\me\\.ssh", &[]) && is_excluded("/home/me/.ssh/id_rsa", &[]) && is_excluded("C:/Users/me/AppData/x", &[]));
+        assert!(!is_excluded("C:\\Users\\me\\Documents", &["".to_owned()]), "an empty exclusion excludes nothing");
+    }
     use flint_fuzzy::engine::{search_with, CancelToken, Options};
     use flint_fuzzy::query::parse;
     use flint_fuzzy::table::{Meta, NO_PARENT};

@@ -12,10 +12,8 @@
 //!   [`DEEP_VOLUME`] so the UI can show and act on them like other results,
 //!   and removed again by [`remove_deep`].
 
-use crate::content::SENSITIVE;
 use crate::traverse::Fs;
 use flint_fuzzy::engine::{search, CancelToken, Options};
-use flint_fuzzy::fold::fold_str;
 use flint_fuzzy::query::Query;
 use flint_fuzzy::table::{flags, EntryId, Meta, NameTable, NO_PARENT, NO_TIME};
 use std::collections::VecDeque;
@@ -99,9 +97,7 @@ pub struct DeepHit {
 }
 
 fn excluded(path: &Path, excluded: &[String]) -> bool {
-    let f = fold_str(&path.to_string_lossy());
-    let f = format!("{f}{}", std::path::MAIN_SEPARATOR);
-    SENSITIVE.iter().any(|s| f.contains(s)) || excluded.iter().any(|e| f.starts_with(&fold_str(e)))
+    crate::content::is_excluded(&path.to_string_lossy(), excluded)
 }
 
 /// Walks `scopes` within `limits` and returns the entries matching `q`.

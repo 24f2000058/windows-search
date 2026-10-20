@@ -16,7 +16,7 @@ jobs:
           targets: x86_64-pc-windows-gnu
           components: clippy
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
       - run: cargo build --locked --target x86_64-pc-windows-gnu -p flint-ui-win32 -p flint-preview -p flint-plugin-epoch
@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
   licenses:
     runs-on: ubuntu-24.04
     steps:

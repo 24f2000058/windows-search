@@ -36,6 +36,10 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+}
+
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -93,8 +97,10 @@ CREATE TABLE IF NOT EXISTS entries (
 impl Store {
     pub fn open(path: &Path) -> Result<(Store, OpenOutcome)> {
         let existed = path.exists();
-        match Self::try_open(path) {
-            Ok((s, outcome)) => Ok((s, if existed { outcome } else { OpenOutcome::Created })),
+        // The outcome comes from `migrate`, decided under the write lock, so
+        // concurrent openers of a new file report one Created.
+        match Self::try_open_retrying(path) {
+            Ok(r) => Ok(r),
             // Only genuine corruption moves the file aside; transient errors
             // (locked, I/O, permissions) are returned so nothing is lost.
             Err(StoreError::Corrupt(_)) if existed => {
@@ -103,7 +109,7 @@ impl Store {
                 for ext in ["db-wal", "db-shm"] {
                     let _ = std::fs::remove_file(path.with_extension(ext));
                 }
-                let (s, _) = Self::try_open(path)?;
+                let (s, _) = Self::try_open_retrying(path)?;
                 Ok((s, OpenOutcome::Recovered { moved_to }))
             }
             Err(e) => Err(e),
@@ -115,6 +121,23 @@ impl Store {
         let mut s = Store { conn, fail_after_ops: None };
         s.migrate()?;
         Ok(s)
+    }
+
+    /// Some steps of opening (switching a new file to WAL, upgrading a read
+    /// lock) return SQLITE_BUSY without consulting the busy timeout, so
+    /// concurrent opens retry the whole open for up to 10 s.
+    fn try_open_retrying(path: &Path) -> Result<(Store, OpenOutcome)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut wait = std::time::Duration::from_millis(5);
+        loop {
+            match Self::try_open(path) {
+                Err(StoreError::Sqlite(e)) if is_busy(&e) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(wait);
+                    wait = (wait * 2).min(std::time::Duration::from_millis(200));
+                }
+                r => return r,
+            }
+        }
     }
 
     fn try_open(path: &Path) -> Result<(Store, OpenOutcome)> {
@@ -316,6 +339,7 @@ mod tests {
         }).collect();
         let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert!(outcomes.iter().all(|o| matches!(o, Ok(OpenOutcome::Created | OpenOutcome::Opened))), "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| matches!(o, Ok(OpenOutcome::Created))).count(), 1, "{outcomes:?}");
         assert!(!p.with_extension(format!("corrupt-{}", std::process::id())).exists());
     }
 
