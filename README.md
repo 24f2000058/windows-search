@@ -1,4 +1,4 @@
-# Flint — Windows search launcher (phase 1: prototypes and benchmarks)
+# Flint — Windows search launcher
 
 Flint (working name) is a keyboard-driven Windows launcher. It does indexed
 filesystem search with aggressive, progressive fuzzy matching, and keeps all
