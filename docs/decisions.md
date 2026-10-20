@@ -663,6 +663,10 @@ guide: [plugins.md](plugins.md).
     `SOURCE_DATE_EPOCH` for archives
   * `--check-repro` builds twice in different directories; the three
     executables were byte-identical here
+  * verified across machines for v0.1.0: rebuilding the tag in this
+    environment gave the same bytes as GitHub's release run for the
+    portable zip, the plugin zip, the notices and every file inside the
+    MSI (SBOMs differed only in the build path, which is now remapped)
   * the MSI is not byte-reproducible (wixl writes a random package code);
     its product code is derived from the version
 * **SBOM:** CycloneDX 1.5 JSON for the shipped binaries

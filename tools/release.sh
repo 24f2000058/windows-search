@@ -120,7 +120,9 @@ echo "== SBOM"
 # Cargo.toml; keep those of the shipped binaries and remove the rest.
 cargo cyclonedx --format json --target "$TARGET" --spec-version 1.5 --override-filename sbom.cdx >/dev/null
 for c in flint-ui-win32 flint-preview; do
-    mv "crates/$c/sbom.cdx.json" "$DIST/sbom/$c.cdx.json"
+    # Like the executables, the SBOM must not depend on where it was built.
+    sed "s|path+file://$ROOT|path+file:///flint|g" "crates/$c/sbom.cdx.json" > "$DIST/sbom/$c.cdx.json"
+    rm "crates/$c/sbom.cdx.json"
 done
 find crates -name sbom.cdx.json -delete
 
