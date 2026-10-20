@@ -2,6 +2,7 @@
 name = "flint-ntfs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 flint-index = { version = "0.1.0", path = "../flint-index" }

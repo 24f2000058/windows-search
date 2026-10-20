@@ -9,6 +9,7 @@
 //! out of search (they could not be opened) but keeps them in the store, so
 //! re-arrival is fast.
 
+use crate::governor::{Governor, GovernorOptions};
 use crate::indexer::{Stats, SyncError, VolumeIndexer};
 use crate::model::{Frn, SourceError, VolumeState};
 use crate::source::JournalSource;
@@ -85,6 +86,8 @@ pub struct VolumeStatus {
     pub state: VolumeState,
     pub stats: Stats,
     pub snapshots_written: u64,
+    /// Waiting for another volume's scan (one heavy scan runs at a time).
+    pub queued: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +128,7 @@ struct Worker {
     volume: u16,
     status: Arc<Mutex<VolumeStatus>>,
     progress: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    queued: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     wake: Sender<()>,
     handle: JoinHandle<()>,
@@ -140,6 +144,7 @@ pub struct Catalog {
     on_change: OnChange,
     workers: Mutex<BTreeMap<String, Worker>>,
     next_volume: Mutex<u16>,
+    governor: Arc<Governor>,
 }
 
 impl Catalog {
@@ -147,7 +152,17 @@ impl Catalog {
     /// on schema creation.
     pub fn new(table: Arc<RwLock<NameTable>>, store_path: PathBuf, snapshot_dir: Option<PathBuf>, opts: CatalogOptions, on_change: OnChange) -> Result<Self, StoreError> {
         drop(Store::open(&store_path)?);
-        Ok(Catalog { table, store_path, snapshot_dir, opts, on_change, workers: Mutex::new(BTreeMap::new()), next_volume: Mutex::new(1) })
+        Ok(Catalog { table, store_path, snapshot_dir, opts, on_change, workers: Mutex::new(BTreeMap::new()), next_volume: Mutex::new(1), governor: Governor::new(GovernorOptions::default(), None) })
+    }
+
+    /// Replaces the resource governor; affects volumes added afterwards.
+    pub fn with_governor(mut self, g: Arc<Governor>) -> Self {
+        self.governor = g;
+        self
+    }
+
+    pub fn governor(&self) -> &Arc<Governor> {
+        &self.governor
     }
 
     /// Starts indexing a volume (no-op if already present). Returns its id.
@@ -173,9 +188,11 @@ impl Catalog {
             state: VolumeState::NotIndexed,
             stats: Stats::default(),
             snapshots_written: 0,
+            queued: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(None));
+        let queued = Arc::new(AtomicBool::new(false));
         let (wake, wake_rx) = channel();
         let ctx = WorkerCtx {
             spec: spec.clone(),
@@ -190,9 +207,11 @@ impl Catalog {
             stop: stop.clone(),
             wake_rx,
             on_change: self.on_change.clone(),
+            governor: self.governor.clone(),
+            queued: queued.clone(),
         };
         let handle = std::thread::Builder::new().name(format!("flint-vol-{}", spec.root_name)).spawn(move || ctx.run()).expect("spawn volume worker");
-        workers.insert(spec.key, Worker { volume, status, progress, stop, wake, handle });
+        workers.insert(spec.key, Worker { volume, status, progress, queued, stop, wake, handle });
         (self.on_change)();
         volume
     }
@@ -236,9 +255,17 @@ impl Catalog {
                 if let Some(p) = w.progress.lock().unwrap().as_ref() {
                     s.progress = p.load(Ordering::Relaxed);
                 }
+                s.queued = w.queued.load(Ordering::Relaxed);
                 s
             })
             .collect()
+    }
+
+    /// True if the volume's entry keys are real file IDs (journal-indexed
+    /// NTFS), which file operations compare with the live file. Traversal
+    /// volumes use synthetic keys.
+    pub fn has_file_ids(&self, volume: u16) -> bool {
+        self.workers.lock().unwrap().values().find(|w| w.volume == volume).is_some_and(|w| matches!(w.status.lock().unwrap().state, VolumeState::Live { .. } | VolumeState::Enumerating { .. }))
     }
 
     pub fn coverage(&self) -> Coverage {
@@ -255,6 +282,7 @@ impl Catalog {
                     c.loading = true;
                     Some(format!("{} loading index", s.root_name))
                 }
+                Phase::Indexing if s.queued => Some(format!("{} queued (one volume is indexed at a time)", s.root_name)),
                 Phase::Indexing => Some(format!("{} indexing ({} entries so far)", s.root_name, s.progress)),
                 Phase::Traversed { complete: false } => Some(format!("{} partially indexed (unreadable folders)", s.root_name)),
                 Phase::Waiting(why) => Some(format!("{} unavailable: {why}", s.root_name)),
@@ -300,6 +328,8 @@ struct WorkerCtx {
     stop: Arc<AtomicBool>,
     wake_rx: Receiver<()>,
     on_change: OnChange,
+    governor: Arc<Governor>,
+    queued: Arc<AtomicBool>,
 }
 
 impl WorkerCtx {
@@ -328,6 +358,7 @@ impl WorkerCtx {
     }
 
     fn run(mut self) {
+        self.governor.setup_thread();
         let mut backoff = self.opts.backoff_min;
         // Store: retried with backoff (e.g. disk temporarily full/locked).
         let mut store = loop {
@@ -350,6 +381,15 @@ impl WorkerCtx {
                 return;
             }
         };
+        ix.governor = Some(self.governor.clone());
+        ix.queued = self.queued.clone();
+        {
+            // Loading from SQLite grows the columns by doubling.
+            let mut t = self.table.write().unwrap();
+            if t.slack_bytes() > t.heap_bytes() / 8 {
+                t.shrink_to_fit();
+            }
+        }
         *self.progress.lock().unwrap() = Some(ix.progress.clone());
         self.set(|s| {
             s.load_source = Some(format!("{load:?}"));

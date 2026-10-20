@@ -227,3 +227,35 @@ fn watched_volume_reconciles_changes_and_recovers_from_overflow() {
     wait_until("full rescan after overflow", || names(&table).contains("X:\\late.txt"));
     assert!(cat.coverage().complete, "{:?}", cat.coverage());
 }
+
+#[test]
+fn heavy_scans_queue_behind_the_governor_and_workers_run_its_thread_setup() {
+    use flint_index::governor::{Governor, GovernorOptions};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let dir = tmpdir("governor");
+    let table = Arc::new(RwLock::new(NameTable::new()));
+    let setups = Arc::new(AtomicUsize::new(0));
+    let s2 = setups.clone();
+    let gov = Governor::new(GovernorOptions::default(), Some(Arc::new(move || {
+        s2.fetch_add(1, Ordering::SeqCst);
+    })));
+    let cat = Catalog::new(table.clone(), dir.join("index.db"), None, opts(), Arc::new(|| {})).unwrap().with_governor(gov.clone());
+    // Hold the only scan permit, as another volume's scan would.
+    let never = AtomicBool::new(false);
+    let permit = gov.acquire_scan(&never, &mut |_| {}).unwrap();
+    let c = sim_with(&["report.pdf"]);
+    let d = sim_with(&["photo.jpg"]);
+    cat.add(VolumeSpec { key: "vol-c".into(), root_name: "C:".into(), root_frn: c.with(|s| s.root) }, journal_opener(c.clone()));
+    cat.add(VolumeSpec { key: "vol-d".into(), root_name: "D:".into(), root_frn: d.with(|s| s.root) }, journal_opener(d.clone()));
+    wait_until("both volumes queued", || cat.statuses().iter().all(|s| s.queued));
+    let cov = cat.coverage();
+    assert!(!cov.complete && cov.problems.iter().all(|p| p.contains("queued")), "{cov:?}");
+    assert!(!names(&table).iter().any(|n| n.ends_with("report.pdf")), "nothing is scanned while queued");
+    drop(permit);
+    wait_until("complete coverage", || cat.coverage().complete);
+    assert!(names(&table).iter().any(|n| n.ends_with("report.pdf")) && names(&table).iter().any(|n| n.ends_with("photo.jpg")));
+    assert_eq!(setups.load(Ordering::SeqCst), 2, "each worker thread runs the setup hook");
+    let st = gov.stats();
+    assert_eq!((st.scans_running, st.scans_queued), (0, 0));
+    cat.shutdown();
+}
