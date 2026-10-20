@@ -141,15 +141,64 @@ impl Default for WebSearch {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Viewer {
+    /// Off by default: no helper process and no file reads until enabled
+    /// (F9 toggles it for the session).
     pub enabled: bool,
+    /// Bytes read per previewed file.
     pub max_file_mb: u64,
+    /// Ask the shell for image/video thumbnails (runs thumbnail handlers in
+    /// the helper process).
+    pub thumbnails: bool,
+    /// A preview taking longer stops the helper (it restarts on demand).
+    pub timeout_ms: u64,
+    /// Memory limit of the helper process (Windows Job Object).
+    pub helper_memory_mb: u64,
     pub audio_video: bool,
     pub ocr: bool,
 }
 
 impl Default for Viewer {
     fn default() -> Self {
-        Viewer { enabled: false, max_file_mb: 64, audio_video: false, ocr: false }
+        Viewer { enabled: false, max_file_mb: 4, thumbnails: true, timeout_ms: 3000, helper_memory_mb: 256, audio_video: false, ocr: false }
+    }
+}
+
+/// Selective content indexing; active only with `privacy.content_indexing`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Content {
+    /// Folders whose files are read; empty = Documents and Desktop.
+    pub roots: Vec<String>,
+    /// Extensions read (without dots); empty = built-in text and Office list.
+    pub extensions: Vec<String>,
+    /// Never read (in addition to `indexing.excluded_paths` and built-in
+    /// sensitive locations such as AppData and .ssh).
+    pub excluded_paths: Vec<String>,
+    pub max_file_mb: u64,
+    /// Characters kept per file.
+    pub max_chars: usize,
+    /// Minutes between re-syncs.
+    pub resync_minutes: u64,
+}
+
+impl Default for Content {
+    fn default() -> Self {
+        Content { roots: Vec::new(), extensions: Vec::new(), excluded_paths: Vec::new(), max_file_mb: 32, max_chars: 200_000, resync_minutes: 30 }
+    }
+}
+
+/// Explicit (F4) walks of locations the index does not cover.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeepSearch {
+    pub max_entries: usize,
+    pub max_seconds: u64,
+    pub max_depth: usize,
+}
+
+impl Default for DeepSearch {
+    fn default() -> Self {
+        DeepSearch { max_entries: 300_000, max_seconds: 10, max_depth: 64 }
     }
 }
 
@@ -223,6 +272,8 @@ pub struct Config {
     pub updates: Updates,
     pub plugins: Plugins,
     pub files: Files,
+    pub content: Content,
+    pub deep_search: DeepSearch,
 }
 
 impl Default for Config {
@@ -238,11 +289,13 @@ impl Default for Config {
             updates: Updates::default(),
             plugins: Plugins::default(),
             files: Files::default(),
+            content: Content::default(),
+            deep_search: DeepSearch::default(),
         }
     }
 }
 
-const SECTIONS: &[&str] = &["general", "search", "indexing", "web_search", "viewer", "privacy", "updates", "plugins", "files"];
+const SECTIONS: &[&str] = &["general", "search", "indexing", "web_search", "viewer", "privacy", "updates", "plugins", "files", "content", "deep_search"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Note {
@@ -433,6 +486,8 @@ fn load_with(path: &Path, migrations: &[Migration]) -> Loaded {
         updates: section(&table, "updates", &mut notes),
         plugins: section(&table, "plugins", &mut notes),
         files: section(&table, "files", &mut notes),
+        content: section(&table, "content", &mut notes),
+        deep_search: section(&table, "deep_search", &mut notes),
     };
     let fixes = config.validate();
     needs_save |= !fixes.is_empty() || notes.iter().any(|n| matches!(n, Note::SectionReset { .. }));

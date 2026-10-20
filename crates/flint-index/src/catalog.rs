@@ -88,6 +88,9 @@ pub struct VolumeStatus {
     pub snapshots_written: u64,
     /// Waiting for another volume's scan (one heavy scan runs at a time).
     pub queued: bool,
+    /// Folders the last traversal could not read (first 100): the places a
+    /// deep search can retry.
+    pub unreadable: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +177,8 @@ impl Catalog {
         let volume = {
             let mut n = self.next_volume.lock().unwrap();
             let v = *n;
-            *n = n.wrapping_add(1).max(1);
+            // DEEP_VOLUME is reserved for deep-search hits.
+            *n = if *n >= crate::deep::DEEP_VOLUME - 1 { 1 } else { *n + 1 };
             v
         };
         let status = Arc::new(Mutex::new(VolumeStatus {
@@ -189,6 +193,7 @@ impl Catalog {
             stats: Stats::default(),
             snapshots_written: 0,
             queued: false,
+            unreadable: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(None));
@@ -465,6 +470,7 @@ impl WorkerCtx {
                                 traversed_at = Some(Instant::now());
                                 backoff = self.opts.backoff_min;
                                 self.set(|s| {
+                                    s.unreadable = rep.skipped.iter().take(100).map(|(p, _)| p.clone()).collect();
                                     s.phase = Phase::Traversed { complete: rep.complete() };
                                     s.state = ix.state.clone();
                                     s.stats = ix.stats.clone();
@@ -487,6 +493,7 @@ impl WorkerCtx {
                             Ok(rep) => {
                                 traversed_at = Some(Instant::now());
                                 self.set(|s| {
+                                    s.unreadable = rep.skipped.iter().take(100).map(|(p, _)| p.clone()).collect();
                                     s.phase = Phase::Traversed { complete: rep.complete() };
                                     s.state = ix.state.clone();
                                     s.stats = ix.stats.clone();

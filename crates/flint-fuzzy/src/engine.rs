@@ -227,6 +227,8 @@ pub struct Status {
     pub indexed_exhausted: bool,
     pub unsupported_filters: Vec<String>,
     pub query_errors: Vec<String>,
+    /// Extra facts for the status line (e.g. content-index coverage).
+    pub notes: Vec<String>,
     pub truncated_query: bool,
     pub elapsed_micros: u64,
     pub generation: u64,
@@ -300,6 +302,13 @@ struct Plan<'a> {
     filters: &'a [Filter],
     path_filter_mask: u64,
     intensity: Intensity,
+    content: Option<&'a dyn ContentMatch>,
+}
+
+/// Answers `content:` filters (backed by the content index). Called from
+/// the parallel scan, so it must be cheap for non-matching slots.
+pub trait ContentMatch: Sync {
+    fn matches(&self, t: &NameTable, id: EntryId) -> bool;
 }
 
 impl<'a> Plan<'a> {
@@ -359,6 +368,7 @@ impl<'a> Plan<'a> {
             filters: &q.filters,
             path_filter_mask,
             intensity,
+            content: None,
         }
     }
 }
@@ -407,7 +417,7 @@ fn passes_filters(t: &NameTable, chain: Option<&[u64]>, id: EntryId, plan: &Plan
                     && chain.is_none_or(|c| c[p as usize] & plan.path_filter_mask == plan.path_filter_mask)
                     && t.parent_path_folded(id).contains(s.as_str())
             }
-            Filter::Content(_) => false,
+            Filter::Content(_) => plan.content.is_some_and(|c| c.matches(t, id)),
         };
         if !ok {
             return false;
@@ -786,18 +796,26 @@ fn finish(t: &NameTable, chain: &[u64], id: EntryId, plan: &Plan, r: Option<(u8,
 }
 
 /// Runs a search. `progress` receives a ranked snapshot after each stage.
-pub fn search(t: &NameTable, q: &Query, opts: &Options, cancel: &CancelToken, mut progress: impl FnMut(&SearchResult)) -> SearchResult {
+/// `content:` filters are reported as unsupported (see [`search_with`]).
+pub fn search(t: &NameTable, q: &Query, opts: &Options, cancel: &CancelToken, progress: impl FnMut(&SearchResult)) -> SearchResult {
+    search_with(t, q, opts, None, cancel, progress)
+}
+
+/// Like [`search`], answering `content:` filters with `content`.
+pub fn search_with(t: &NameTable, q: &Query, opts: &Options, content: Option<&dyn ContentMatch>, cancel: &CancelToken, mut progress: impl FnMut(&SearchResult)) -> SearchResult {
     let t0 = Instant::now();
     let deadline = opts.deadline.map(|d| t0 + d);
-    let plan = Plan::new(q, opts.intensity);
+    let mut plan = Plan::new(q, opts.intensity);
+    plan.content = content;
     let mut status = Status {
         stages: Vec::new(),
         stop: Stop::StagesDone,
         total_matched: 0,
         considered: 0,
         indexed_exhausted: false,
-        unsupported_filters: q.filters.iter().filter_map(|f| if let Filter::Content(s) = f { Some(format!("content:{s}")) } else { None }).collect(),
+        unsupported_filters: if content.is_some() { Vec::new() } else { q.filters.iter().filter_map(|f| if let Filter::Content(s) = f { Some(format!("content:{s}")) } else { None }).collect() },
         query_errors: q.errors.clone(),
+        notes: Vec::new(),
         truncated_query: plan.toks.iter().chain(plan.dirs.iter()).any(|t| t.pat.truncated) || plan.sub.pat.truncated,
         elapsed_micros: 0,
         generation: t.generation(),

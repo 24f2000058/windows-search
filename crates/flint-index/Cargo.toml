@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 flint-fuzzy = { version = "0.1.0", path = "../flint-fuzzy" }
+flint-preview = { version = "0.1.0", path = "../flint-preview" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

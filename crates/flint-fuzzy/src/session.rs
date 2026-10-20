@@ -7,7 +7,8 @@
 //! can never overwrite newer results. Nothing here is persisted (search
 //! history is off by default and lives elsewhere if enabled).
 
-use crate::engine::{search, CancelToken, Options, SearchResult};
+use crate::engine::{search_with, CancelToken, ContentMatch, Options, SearchResult};
+use crate::query::Filter;
 use crate::query::{parse_with, Clock, UtcOffset};
 use crate::table::NameTable;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +47,35 @@ pub struct Session {
 
 const CACHE_SLOTS: usize = 16;
 
+/// (query text, options, table generation, hour, content generation).
+type CacheKey = (String, Options, u64, i64, u64);
+
+/// Answers `content:` filters from a content index.
+pub trait ContentProvider: Send + Sync {
+    /// Matcher for one `content:` filter's text.
+    fn matcher(&self, text: &str) -> Result<Box<dyn ContentMatch + Send>, String>;
+    /// Changes whenever the indexed content changes (part of the cache key).
+    fn generation(&self) -> u64;
+    /// Coverage caveat for the status line ("content index: 40 files pending").
+    fn note(&self) -> Option<String>;
+}
+
+/// Several `content:` filters must all match.
+struct AllOf(Vec<Box<dyn ContentMatch + Send>>);
+
+impl ContentMatch for AllOf {
+    fn matches(&self, t: &NameTable, id: crate::table::EntryId) -> bool {
+        self.0.iter().all(|m| m.matches(t, id))
+    }
+}
+
+pub struct SessionConfig {
+    pub debounce: Duration,
+    /// Time zone for date filters (`|_| 0` = UTC).
+    pub offset: Arc<UtcOffset>,
+    pub content: Option<Arc<dyn ContentProvider>>,
+}
+
 impl Session {
     /// `sink` is called on the worker thread; it should post to the UI thread.
     /// Dates in queries are interpreted in UTC.
@@ -56,6 +86,12 @@ impl Session {
     /// Like [`new`](Self::new), with dates in queries interpreted in the
     /// zone given by `offset` (normally the user's local zone).
     pub fn with_time_zone(table: Arc<RwLock<NameTable>>, debounce: Duration, offset: Arc<UtcOffset>, sink: impl Fn(Event) + Send + 'static) -> Self {
+        Self::start(table, SessionConfig { debounce, offset, content: None }, sink)
+    }
+
+    /// The general constructor: time zone and an optional content index.
+    pub fn start(table: Arc<RwLock<NameTable>>, cfg: SessionConfig, sink: impl Fn(Event) + Send + 'static) -> Self {
+        let SessionConfig { debounce, offset, content } = cfg;
         let (tx, rx) = channel::<Msg>();
         let latest = Arc::new(AtomicU64::new(0));
         let inflight = Arc::new(Mutex::new(CancelToken::new()));
@@ -65,7 +101,7 @@ impl Session {
             .spawn(move || {
                 // Keyed by text, options, table generation and the hour, so
                 // relative dates ("today") never outlive their meaning.
-                let mut cache: Vec<((String, Options, u64, i64), SearchResult)> = Vec::new();
+                let mut cache: Vec<(CacheKey, SearchResult)> = Vec::new();
                 let mut pending: Option<Msg> = None;
                 loop {
                     let msg = match pending.take() {
@@ -100,7 +136,8 @@ impl Session {
                     let cancel = inflight_w.lock().unwrap().clone();
                     let t = table.read().unwrap();
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-                    let key = (raw.clone(), opts.clone(), t.generation(), now / 3600);
+                    let content_gen = content.as_ref().map_or(0, |c| c.generation());
+                    let key = (raw.clone(), opts.clone(), t.generation(), now / 3600, content_gen);
                     if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
                         let entry = cache.remove(pos);
                         let result = entry.1.clone();
@@ -109,12 +146,30 @@ impl Session {
                         continue;
                     }
                     let q = parse_with(&raw, &Clock { now, offset: &*offset });
-                    let result = search(&t, &q, &opts, &cancel, |partial| {
+                    // content: filters, answered by the content index if any.
+                    let mut notes = Vec::new();
+                    let wanted: Vec<&str> = q.filters.iter().filter_map(|f| if let Filter::Content(s) = f { Some(s.as_str()) } else { None }).collect();
+                    let matcher: Option<AllOf> = match (&content, wanted.is_empty()) {
+                        (_, true) | (None, _) => None,
+                        (Some(c), false) => {
+                            notes.extend(c.note());
+                            match wanted.iter().map(|w| c.matcher(w)).collect::<Result<Vec<_>, _>>() {
+                                Ok(ms) => Some(AllOf(ms)),
+                                Err(e) => {
+                                    notes.push(format!("content search failed: {e}"));
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    let cm = matcher.as_ref().map(|m| m as &dyn ContentMatch);
+                    let mut result = search_with(&t, &q, &opts, cm, &cancel, |partial| {
                         if latest_w.load(Ordering::SeqCst) == generation {
                             sink(Event::Partial { generation, result: partial.clone() });
                         }
                     });
                     drop(t);
+                    result.status.notes.extend(notes);
                     if cancel.is_canceled() || latest_w.load(Ordering::SeqCst) != generation {
                         continue;
                     }
