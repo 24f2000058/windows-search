@@ -43,8 +43,10 @@ fn add_watched(cat: &Catalog, p: &Planned, key: String, exclude: &[PathBuf]) {
 
 /// Brings the catalog in line with the current volumes and settings.
 /// `only_root` restricts indexing to one folder (the `--root` option).
-/// Returns human-readable notes (skips and mode decisions).
-pub fn sync(cat: &Catalog, cfg: &Indexing, only_root: Option<&str>) -> Vec<String> {
+/// Returns human-readable notes (skips and mode decisions) and the mount
+/// points of volumes skipped by settings (the places deep search can look).
+pub fn sync(cat: &Catalog, cfg: &Indexing, only_root: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut unindexed = Vec::new();
     let exclude: Vec<PathBuf> = cfg.excluded_paths.iter().map(PathBuf::from).collect();
     let mut notes = Vec::new();
     let (infos, planned) = if let Some(root) = only_root {
@@ -56,6 +58,9 @@ pub fn sync(cat: &Catalog, cfg: &Indexing, only_root: Option<&str>) -> Vec<Strin
         let (planned, skipped) = plan(&cands, cfg);
         for s in skipped {
             notes.push(format!("skipped {}: {}", s.key, s.reason));
+            if let Some(m) = cands.iter().find(|c| c.key == s.key).and_then(|c| c.mounts.first()) {
+                unindexed.push(m.clone());
+            }
         }
         (infos, planned)
     };
@@ -97,5 +102,5 @@ pub fn sync(cat: &Catalog, cfg: &Indexing, only_root: Option<&str>) -> Vec<Strin
             notes.push(format!("removed {k} (no longer present or excluded)"));
         }
     }
-    notes
+    (notes, unindexed)
 }

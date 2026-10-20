@@ -206,6 +206,68 @@ pub fn current_choice(text: &str, c: &FilterChoice) -> Option<usize> {
     }
 }
 
+/// Hex dump: offset, 16 bytes, printable ASCII.
+pub fn format_hex(bytes: &[u8], file_size: u64) -> String {
+    let mut out = String::new();
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        out.push_str(&format!("{:08x}  ", row * 16));
+        for i in 0..16 {
+            match chunk.get(i) {
+                Some(b) => out.push_str(&format!("{b:02x} ")),
+                None => out.push_str("   "),
+            }
+        }
+        out.push(' ');
+        out.extend(chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }));
+        out.push('\n');
+    }
+    if (bytes.len() as u64) < file_size {
+        out.push_str(&format!("… first {} of {} bytes\n", bytes.len(), file_size));
+    }
+    out
+}
+
+fn size_text(n: u64) -> String {
+    format_size(n, false, false)
+}
+
+/// (header line, body text) for the viewer pane. Never claims more than
+/// the helper produced: truncation and warnings are always shown.
+pub fn preview_text(p: &flint_preview::Preview) -> (String, String) {
+    use flint_preview::Preview as P;
+    match p {
+        P::Text { text, encoding, truncated } => {
+            let mut h = encoding.clone();
+            if *truncated {
+                h.push_str(" · showing the beginning only");
+            }
+            (h, text.clone())
+        }
+        P::Hex { offset_bytes, file_size } => (format!("binary file · {}", size_text(*file_size)), format_hex(offset_bytes, *file_size)),
+        P::Image { format, width, height, thumbnail } => {
+            let dims = if *width > 0 { format!("{width} × {height}") } else { "size unknown".into() };
+            (format!("{format} image · {dims}"), if thumbnail.is_some() { String::new() } else { "(no thumbnail available)".into() })
+        }
+        P::Archive { format, entries, total_entries, total_size, warnings } => {
+            let mut body = String::new();
+            for w in warnings {
+                body.push_str(&format!("Warning: {w}\n"));
+            }
+            if !warnings.is_empty() {
+                body.push('\n');
+            }
+            for e in entries {
+                body.push_str(&if e.is_dir { format!("{}\n", e.name) } else { format!("{}  ({})\n", e.name, size_text(e.size)) });
+            }
+            if (entries.len() as u64) < *total_entries {
+                body.push_str(&format!("… and {} more\n", total_entries - entries.len() as u64));
+            }
+            (format!("{format} archive · {total_entries} entries · {} uncompressed · listing only, nothing extracted", size_text(*total_size)), body)
+        }
+        P::Unsupported { kind, reason } => (kind.clone(), reason.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +338,19 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days);
         }
+    }
+
+    #[test]
+    fn preview_rendering_shows_limits_and_warnings() {
+        use flint_preview::{ArchiveEntry, Preview};
+        let (h, b) = preview_text(&Preview::Text { text: "abc".into(), encoding: "UTF-8".into(), truncated: true });
+        assert_eq!((h.as_str(), b.as_str()), ("UTF-8 · showing the beginning only", "abc"));
+        let (h, b) = preview_text(&Preview::Hex { offset_bytes: b"MZ\x00\x01ABCDEFGHIJKLMNOP".to_vec(), file_size: 4096 });
+        assert!(h.starts_with("binary file · 4 KB"));
+        assert!(b.starts_with("00000000  4d 5a 00 01 41 42") && !b.contains("|") && b.contains("MZ..ABCD") && b.contains("first 20 of 4096 bytes"), "{b}");
+        let (h, b) = preview_text(&Preview::Archive { format: "ZIP".into(), entries: vec![ArchiveEntry { name: "a.txt".into(), size: 10, compressed: 5, is_dir: false }], total_entries: 3, total_size: 10, warnings: vec!["possible zip bomb".into()] });
+        assert!(h.contains("3 entries") && h.contains("nothing extracted"));
+        assert!(b.starts_with("Warning: possible zip bomb") && b.contains("a.txt  (10 B)") && b.ends_with("… and 2 more\n"), "{b}");
     }
 
     #[test]

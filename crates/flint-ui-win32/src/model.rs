@@ -88,6 +88,8 @@ pub fn status_line(s: &Status, shown: usize, cov: &Coverage, deeper: Option<crat
     if !s.query_errors.is_empty() {
         parts.push(format!("ignored invalid filters: {}", s.query_errors.join(" ")));
     }
+    // Content-index coverage and similar caveats from the search.
+    parts.extend(s.notes.iter().cloned());
     if !cov.complete {
         // Even "all indexed entries examined" says nothing about unindexed
         // parts of the filesystem.

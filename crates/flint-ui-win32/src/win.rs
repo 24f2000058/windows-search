@@ -53,6 +53,11 @@ const WM_APP_EVENT: u32 = WM_APP + 1;
 const WM_APP_INDEX: u32 = WM_APP + 2;
 /// A background task finished; lParam is a `Box<String>` to show.
 const WM_APP_NOTICE: u32 = WM_APP + 3;
+/// A preview arrived; lParam is a `Box<(u64, Delivered)>`.
+pub(crate) const WM_APP_PREVIEW: u32 = WM_APP + 4;
+/// A deep search finished; lParam is a `Box<DeepDone>`.
+const WM_APP_DEEP: u32 = WM_APP + 5;
+const ID_PANE: isize = 120;
 const ID_EDIT: isize = 100;
 const ID_LIST: isize = 101;
 /// Filter-bar dropdowns: ID_FILTER + index.
@@ -120,8 +125,28 @@ pub(crate) struct State {
     refresh_pending: Cell<bool>,
     /// Range-selection anchor (Shift+Up/Down).
     anchor: Cell<Option<usize>>,
+    /// Viewer pane (crate::pane).
+    pub(crate) pane_edit: HWND,
+    pub(crate) viewer: RefCell<Option<flint_preview::scheduler::Viewer>>,
+    pub(crate) viewer_on: Cell<bool>,
+    pub(crate) viewer_cfg: flint_config::Viewer,
+    pub(crate) preview_gen: Cell<u64>,
+    pub(crate) last_preview: RefCell<Option<flint_preview::scheduler::FileKey>>,
+    pub(crate) pane_header: RefCell<String>,
+    pub(crate) pane_bitmap: Cell<(HBITMAP, i32, i32)>,
+    pub(crate) host_exe: std::path::PathBuf,
+    mono_font: HFONT,
+    /// Background content indexing (privacy.content_indexing).
+    content_service: RefCell<Option<flint_index::content::ContentService>>,
+    /// Mounted volumes skipped by settings (deep-search scopes).
+    deep_scopes: Arc<Mutex<Vec<String>>>,
+    deep_cancel: RefCell<Arc<std::sync::atomic::AtomicBool>>,
+    deep_cfg: flint_config::DeepSearch,
+    /// Deep-search hits are in the table (removed on the next edit).
+    deep_active: Cell<bool>,
+    index_was_complete: Cell<bool>,
     theme: Theme,
-    palette: Cell<Palette>,
+    pub(crate) palette: Cell<Palette>,
     /// (window background, edit background)
     brushes: Cell<(HBRUSH, HBRUSH)>,
     icons: RefCell<Icons>,
@@ -216,11 +241,13 @@ fn apply_palette(s: &State) {
 /// Re-plans volumes off the UI thread (startup, device arrival/removal).
 fn resync_volumes(s: &State) {
     if let Some(cat) = s.catalog.clone() {
-        let (cfg, root) = (s.indexing.clone(), s.only_root.clone());
+        let (cfg, root, scopes) = (s.indexing.clone(), s.only_root.clone(), s.deep_scopes.clone());
         std::thread::spawn(move || {
-            for n in crate::volumes::sync(&cat, &cfg, root.as_deref()) {
+            let (notes, unindexed) = crate::volumes::sync(&cat, &cfg, root.as_deref());
+            for n in notes {
                 println!("volumes: {n}");
             }
+            *scopes.lock().unwrap() = unindexed;
         });
     }
 }
@@ -248,9 +275,19 @@ fn make_fonts(dpi: u32) -> (HFONT, HFONT) {
     }
 }
 
-fn layout(s: &State) {
+pub(crate) fn layout(s: &State) {
     let d = s.dpi.get();
     let (w, pad, eh, lh) = (scale(WIDTH, d), scale(8, d), scale(32, d), scale(420, d));
+    unsafe {
+        if s.viewer_on.get() {
+            let (r, top) = pane_rect(s);
+            let y = top + crate::pane::top_height(s);
+            SetWindowPos(s.pane_edit, null_mut(), r.left, y, r.right - r.left, (r.bottom - y).max(0), SWP_NOZORDER | SWP_SHOWWINDOW);
+            SendMessageW(s.pane_edit, WM_SETFONT, s.mono_font as WPARAM, 1);
+        } else {
+            ShowWindow(s.pane_edit, SW_HIDE);
+        }
+    }
     let fw = scale(FILTER_W, d);
     let n = s.combos.len() as i32;
     let edit_w = w - 2 * pad - n * (fw + pad);
@@ -272,8 +309,92 @@ fn layout(s: &State) {
     }
 }
 
-fn window_size(dpi: u32) -> (i32, i32) {
-    (scale(WIDTH, dpi), scale(8 * 3 + 32 + 420 + 26, dpi))
+fn window_size(dpi: u32, viewer: bool) -> (i32, i32) {
+    (scale(WIDTH + if viewer { crate::pane::PANE_W } else { 0 }, dpi), scale(8 * 3 + 32 + 420 + 26, dpi))
+}
+
+/// Viewer pane rectangle (client coordinates) and its top.
+fn pane_rect(s: &State) -> (RECT, i32) {
+    let d = s.dpi.get();
+    let (pad, eh, lh) = (scale(8, d), scale(32, d), scale(420, d));
+    let top = pad * 2 + eh;
+    (RECT { left: scale(WIDTH, d) - pad / 2, top, right: scale(WIDTH + crate::pane::PANE_W, d) - pad, bottom: top + lh }, top)
+}
+
+/// F9: viewer on/off for this session.
+fn toggle_viewer(s: &State) {
+    let on = !s.viewer_on.get();
+    s.viewer_on.set(on);
+    if on {
+        crate::pane::start(s);
+    } else {
+        crate::pane::stop(s);
+    }
+    unsafe {
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(s.hwnd, &mut r);
+        let (w, h) = window_size(s.dpi.get(), on);
+        SetWindowPos(s.hwnd, null_mut(), r.left, r.top, w, h, SWP_NOZORDER);
+    }
+    layout(s);
+    crate::pane::selection_changed(s);
+    s.say(if on { "viewer on (F9 to turn off)" } else { "viewer off: no file is read for previews" });
+}
+
+/// Result of a deep search, posted to the UI thread.
+pub(crate) struct DeepDone {
+    generation: u64,
+    hits: Vec<flint_index::deep::DeepHit>,
+    report: flint_index::deep::DeepReport,
+}
+
+/// F4: walks locations the index does not cover (bounded, cancellable).
+fn deep_search(s: &State) {
+    let mut scopes: Vec<std::path::PathBuf> = s.deep_scopes.lock().unwrap().iter().map(std::path::PathBuf::from).collect();
+    if let Some(c) = &s.catalog {
+        for v in c.statuses() {
+            scopes.extend(v.unreadable.iter().cloned());
+        }
+    }
+    let text = s.query_text.borrow().clone();
+    if scopes.is_empty() {
+        return s.say("nothing unindexed to search: every planned location is indexed (excluded folders are never searched)");
+    }
+    if text.trim().is_empty() {
+        return s.say("type what to look for, then press F4");
+    }
+    s.deep_cancel.borrow().store(true, Ordering::SeqCst);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *s.deep_cancel.borrow_mut() = cancel.clone();
+    let generation = s.latest.load(Ordering::SeqCst);
+    let (exclude, opts, tz, hwnd) = (s.indexing.excluded_paths.clone(), s.opts.borrow().clone(), s.tz.clone(), s.hwnd as usize);
+    let limits = flint_index::deep::DeepLimits { max_entries: s.deep_cfg.max_entries, max_time: Duration::from_secs(s.deep_cfg.max_seconds.max(1)), max_depth: s.deep_cfg.max_depth };
+    s.say(&format!("deep search in {} unindexed location(s)… (editing the query cancels)", scopes.len()));
+    std::thread::Builder::new()
+        .name("flint-deep".into())
+        .spawn(move || {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            let q = parse_with(&text, &Clock { now, offset: &*tz });
+            let fs = flint_index::traverse::RealFs;
+            let (hits, report) = flint_index::deep::deep_search(&fs, &scopes, &exclude, &q, &opts, &limits, &cancel);
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let p = Box::into_raw(Box::new(DeepDone { generation, hits, report }));
+            unsafe {
+                if PostMessageW(hwnd as HWND, WM_APP_DEEP, 0, p as LPARAM) == 0 {
+                    drop(Box::from_raw(p));
+                }
+            }
+        })
+        .ok();
+}
+
+fn clear_deep(s: &State) {
+    s.deep_cancel.borrow().store(true, Ordering::SeqCst);
+    if s.deep_active.replace(false) {
+        flint_index::deep::remove_deep(&mut s.table.write().unwrap());
+    }
 }
 
 /// (Re)fills the filter dropdowns; "older than a year" depends on today.
@@ -330,12 +451,17 @@ fn show(s: &State) {
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(mon, &mut mi);
-        let (w, h) = window_size(s.dpi.get());
+        let (w, h) = window_size(s.dpi.get(), s.viewer_on.get());
         let wa = mi.rcWork;
         let x = wa.left + ((wa.right - wa.left) - w) / 2;
         let y = wa.top + ((wa.bottom - wa.top) - h) / 4;
         SetWindowPos(s.hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
         fill_filters(s);
+        if s.viewer_on.get() {
+            crate::pane::start(s);
+            layout(s);
+            crate::pane::selection_changed(s);
+        }
         SetForegroundWindow(s.hwnd);
         SetFocus(s.edit);
         SendMessageW(s.edit, EM_SETSEL, 0, -1);
@@ -351,6 +477,9 @@ fn show(s: &State) {
 
 fn hide(s: &State) {
     unsafe { ShowWindow(s.hwnd, SW_HIDE) };
+    // No helper process while hidden (it restarts on the next preview).
+    crate::pane::stop(s);
+    clear_deep(s);
     // Release derived search caches while idle; history is never stored.
     s.table.read().unwrap().trim_caches();
     s.session.clear_cache();
@@ -363,8 +492,10 @@ fn submit(s: &State) {
     let mut buf = vec![0u16; 1024];
     let n = unsafe { GetWindowTextW(s.edit, buf.as_mut_ptr(), buf.len() as i32) } as usize;
     let text = String::from_utf16_lossy(&buf[..n]);
-    // A new query starts from the configured options again.
+    // A new query starts from the configured options again, without the
+    // previous query's deep-search hits.
     *s.opts.borrow_mut() = s.base_opts.clone();
+    clear_deep(s);
     run_query(s, text);
     sync_filters(s);
 }
@@ -448,6 +579,7 @@ fn select_rows(s: &State, a: usize, focus: usize) {
         }
         SendMessageW(s.list, LVM_ENSUREVISIBLE, focus, 0);
     }
+    crate::pane::selection_changed(s);
 }
 
 /// Text of one result cell (also what screen readers get).
@@ -459,6 +591,10 @@ fn cell_text(s: &State, t: &NameTable, hit: &flint_fuzzy::engine::Hit, col: i32)
         1 => t.parent_path(hit.id),
         2 => format_size(m.size, is_dir, m.flags & flags::META_STALE != 0),
         3 => format_time(m.mtime, &s.clock()),
+        _ if m.volume == flint_index::deep::DEEP_VOLUME => "deep (unindexed)".to_owned(),
+        // Filter-only results (one filter pass, no text): every row is
+        // simply a filter match, so no tier label.
+        _ if s.model.borrow().status.as_ref().is_some_and(|st| st.stages.len() == 1 && st.stages[0].stage == flint_fuzzy::engine::Stage::Exhaustive) => String::new(),
         _ => match_label(hit.tier).to_owned(),
     }
 }
@@ -651,6 +787,8 @@ fn on_key(s: &State, vk: u16, alt: bool) -> bool {
         VK_RETURN => activate_selected(s),
         VK_ESCAPE => hide(s),
         VK_F3 => search_deeper(s),
+        VK_F4 => deep_search(s),
+        VK_F9 => toggle_viewer(s),
         VK_F2 => crate::actions::run(s, Act::Rename),
         VK_DELETE if ctrl && shift => crate::actions::run(s, Act::DeletePermanently),
         VK_DELETE if ctrl => crate::actions::run(s, Act::Recycle),
@@ -804,8 +942,15 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                     // Our own programmatic selection arrives while the model
                     // may be borrowed; that change is already reflected.
                     if nm.uNewState & LVIS_FOCUSED != 0 && nm.iItem >= 0 {
-                        if let Ok(mut m) = s.model.try_borrow_mut() {
-                            m.selected = Some(nm.iItem as usize);
+                        let moved = match s.model.try_borrow_mut() {
+                            Ok(mut m) => {
+                                m.selected = Some(nm.iItem as usize);
+                                true
+                            }
+                            Err(_) => false,
+                        };
+                        if moved {
+                            crate::pane::selection_changed(s);
                         }
                     }
                     0
@@ -832,6 +977,14 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             let notice = s.notice.borrow().clone();
             if !notice.is_empty() {
                 line = format!("{notice}   |   {line}");
+            }
+            let unindexed = !s.deep_scopes.lock().unwrap().is_empty() || s.catalog.as_ref().is_some_and(|c| c.statuses().iter().any(|v| !v.unreadable.is_empty()));
+            if unindexed && s.model.borrow().status.is_some() && !s.deep_active.get() {
+                line.push_str(" · F4: search unindexed locations");
+            }
+            if s.viewer_on.get() {
+                let (r, _) = pane_rect(s);
+                crate::pane::paint(s, hdc, r);
             }
             let w = wide(&line);
             // Erase first: text is drawn transparently and repaints are not
@@ -902,6 +1055,26 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             }
             0
         }
+        WM_APP_PREVIEW => {
+            let (g, r) = *Box::from_raw(lp as *mut (u64, flint_preview::scheduler::Delivered));
+            crate::pane::on_result(s, g, r);
+            0
+        }
+        WM_APP_DEEP => {
+            let done = *Box::from_raw(lp as *mut DeepDone);
+            if done.generation != s.latest.load(Ordering::SeqCst) {
+                return 0; // the query changed meanwhile
+            }
+            let n = done.hits.len();
+            flint_index::deep::insert_hits(&mut s.table.write().unwrap(), &done.hits);
+            s.deep_active.set(n > 0);
+            let msg = format!("{} · {n} match(es) outside the index", done.report.summary());
+            let text = s.query_text.borrow().clone();
+            run_query(s, text);
+            *s.command_line.borrow_mut() = msg;
+            InvalidateRect(s.hwnd, null(), 0);
+            0
+        }
         WM_APP_NOTICE => {
             let text = *Box::from_raw(lp as *mut String);
             s.say(text.lines().next().unwrap_or(""));
@@ -914,6 +1087,13 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
         }
         WM_APP_INDEX => {
             INDEX_REPAINT_PENDING.store(false, Ordering::SeqCst);
+            // The filename index just finished: content indexing can start.
+            let complete = coverage(s).complete;
+            if complete && !s.index_was_complete.replace(true) {
+                if let Some(c) = s.content_service.borrow().as_ref() {
+                    c.wake();
+                }
+            }
             if s.refresh_pending.replace(false) {
                 // Show the effect of a file action; the status keeps its message.
                 let (text, msg) = (s.query_text.borrow().clone(), s.command_line.borrow().clone());
@@ -933,7 +1113,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             FillRect(wp as HDC, &rc, s.brushes.get().0);
             1
         }
-        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
             let p = s.palette.get();
             SetTextColor(wp as HDC, p.text);
             SetBkColor(wp as HDC, p.edit_bg);
@@ -1098,12 +1278,33 @@ pub fn run() {
             SendMessageW(list, LVM_INSERTCOLUMNW, i, &col as *const _ as LPARAM);
         }
         SetWindowSubclass(edit, Some(edit_proc), 1, 0);
+        // Viewer body: read-only, never takes keyboard focus from the box.
+        let pane_edit = CreateWindowExW(0, edit_cls.as_ptr(), null(), WS_CHILD | WS_VSCROLL | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32, 0, 0, 10, 10, hwnd, ID_PANE as HMENU, hinst, null());
+        let mono_face = wide("Consolas");
+        let mono_font = CreateFontW(-scale(13, dpi), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32, CLEARTYPE_QUALITY as u32, (FIXED_PITCH | FF_MODERN) as u32, mono_face.as_ptr());
 
         let table = Arc::new(RwLock::new(NameTable::new()));
         let latest = Arc::new(AtomicU64::new(0));
         let hwnd_bits = hwnd as usize;
         let tz: Arc<UtcOffset> = Arc::new(crate::resources::local_offset);
-        let session = Session::with_time_zone(table.clone(), Duration::from_millis(cfg.search.debounce_ms), tz.clone(), move |ev: Event| {
+        // Content search: the real index when enabled, otherwise a provider
+        // that says why `content:` is unavailable.
+        let content_index = if cfg.privacy.content_indexing {
+            match flint_index::content::ContentIndex::open(&paths.data_dir.join("content.db")) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    notices.push(format!("content index unavailable: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let provider: Arc<dyn flint_fuzzy::session::ContentProvider> = match &content_index {
+            Some(c) => c.clone(),
+            None => flint_index::content::ContentIndex::disabled("content search is off; enable privacy.content_indexing in settings"),
+        };
+        let session = Session::start(table.clone(), flint_fuzzy::session::SessionConfig { debounce: Duration::from_millis(cfg.search.debounce_ms), offset: tz.clone(), content: Some(provider) }, move |ev: Event| {
             let p = Box::into_raw(Box::new(ev));
             if PostMessageW(hwnd_bits as HWND, WM_APP_EVENT, 0, p as LPARAM) == 0 {
                 drop(Box::from_raw(p));
@@ -1132,6 +1333,35 @@ pub fn run() {
                     }
                 }
             }
+        };
+        let host_exe = exe_dir.join("flint-preview-host.exe");
+        let content_service = match (&content_index, &catalog) {
+            (Some(ci), Some(cat)) => {
+                let profile = std::env::var("USERPROFILE").unwrap_or_default();
+                let roots = if cfg.content.roots.is_empty() { vec![format!("{profile}\\Documents"), format!("{profile}\\Desktop")] } else { cfg.content.roots.clone() };
+                let ccfg = flint_index::content::ContentConfig {
+                    roots,
+                    extensions: if cfg.content.extensions.is_empty() { flint_index::content::ContentConfig::default_extensions() } else { cfg.content.extensions.iter().map(|e| e.trim_start_matches('.').to_ascii_lowercase()).collect() },
+                    excluded: cfg.indexing.excluded_paths.iter().chain(&cfg.content.excluded_paths).cloned().collect(),
+                    max_file_bytes: cfg.content.max_file_mb << 20,
+                    limits: flint_preview::Limits { max_read: cfg.content.max_file_mb << 20, max_chars: cfg.content.max_chars, thumb: 0, ..Default::default() },
+                };
+                let mut hc = flint_preview::client::HostConfig::new(host_exe.clone());
+                hc.timeout = Duration::from_secs(20);
+                hc.memory_limit = cfg.viewer.helper_memory_mb << 20;
+                let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                Some(flint_index::content::ContentService::start(flint_index::content::ContentJob {
+                    index: ci.clone(),
+                    db: paths.data_dir.join("content.db"),
+                    table: table.clone(),
+                    cfg: ccfg,
+                    extractor: Box::new(flint_preview::client::HostClient::new(hc)),
+                    governor: cat.governor().clone(),
+                    every: Duration::from_secs(cfg.content.resync_minutes.max(1) * 60),
+                    on_change,
+                }))
+            }
+            _ => None,
         };
         let (font, bold) = make_fonts(dpi);
         let mut freq = 0i64;
@@ -1170,6 +1400,22 @@ pub fn run() {
             modal: Cell::new(0),
             refresh_pending: Cell::new(false),
             anchor: Cell::new(None),
+            pane_edit,
+            viewer: RefCell::new(None),
+            viewer_on: Cell::new(cfg.viewer.enabled),
+            viewer_cfg: cfg.viewer.clone(),
+            preview_gen: Cell::new(0),
+            last_preview: RefCell::new(None),
+            pane_header: RefCell::new(String::new()),
+            pane_bitmap: Cell::new((null_mut(), 0, 0)),
+            host_exe,
+            mono_font,
+            content_service: RefCell::new(content_service),
+            deep_scopes: Arc::new(Mutex::new(Vec::new())),
+            deep_cancel: RefCell::new(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            deep_cfg: cfg.deep_search.clone(),
+            deep_active: Cell::new(false),
+            index_was_complete: Cell::new(false),
             theme: cfg.general.theme,
             palette: Cell::new(crate::model::palette(false)),
             brushes: Cell::new((null_mut(), null_mut())),
@@ -1202,7 +1448,10 @@ pub fn run() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        // Stops volume workers; each writes its startup snapshot.
+        // Stops the viewer and content helpers, then the volume workers
+        // (each writes its startup snapshot).
+        crate::pane::stop(&state);
+        state.content_service.borrow_mut().take();
         if let Some(c) = &state.catalog {
             c.shutdown();
         }

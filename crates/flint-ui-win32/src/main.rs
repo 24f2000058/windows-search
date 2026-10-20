@@ -10,6 +10,8 @@ mod discovery;
 mod icons;
 mod model;
 #[cfg(windows)]
+mod pane;
+#[cfg(windows)]
 mod prompt;
 mod ux;
 #[cfg(windows)]
