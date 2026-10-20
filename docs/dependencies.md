@@ -43,6 +43,7 @@ that are not explicitly approved. Bundled native code: SQLite (public domain) vi
 | serde_spanned | 1.1.2 | MIT OR Apache-2.0 |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
 | smallvec | 1.16.3 | MIT OR Apache-2.0 |
+| syn | 2.0.119 | MIT OR Apache-2.0 |
 | syn | 3.0.9 | MIT OR Apache-2.0 |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 |
 | tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT |
@@ -53,8 +54,18 @@ that are not explicitly approved. Bundled native code: SQLite (public domain) vi
 | unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-normalization | 0.1.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 |
+| windows | 0.62.2 | MIT OR Apache-2.0 |
+| windows-collections | 0.3.2 | MIT OR Apache-2.0 |
+| windows-core | 0.62.2 | MIT OR Apache-2.0 |
+| windows-future | 0.3.2 | MIT OR Apache-2.0 |
+| windows-implement | 0.60.2 | MIT OR Apache-2.0 |
+| windows-interface | 0.59.3 | MIT OR Apache-2.0 |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 |
+| windows-numerics | 0.3.1 | MIT OR Apache-2.0 |
+| windows-result | 0.4.1 | MIT OR Apache-2.0 |
+| windows-strings | 0.5.1 | MIT OR Apache-2.0 |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
+| windows-threading | 0.2.1 | MIT OR Apache-2.0 |
 | winnow | 1.0.4 | MIT |
 
-49 crates. Distinct license expressions: `(MIT OR Apache-2.0) AND Unicode-3.0`; `Apache-2.0 OR MIT`; `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; `MIT`; `MIT OR Apache-2.0`; `MIT/Apache-2.0`; `Unlicense OR MIT`; `Zlib`; `Zlib OR Apache-2.0 OR MIT`
+60 crates. Distinct license expressions: `(MIT OR Apache-2.0) AND Unicode-3.0`; `Apache-2.0 OR MIT`; `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; `MIT`; `MIT OR Apache-2.0`; `MIT/Apache-2.0`; `Unlicense OR MIT`; `Zlib`; `Zlib OR Apache-2.0 OR MIT`

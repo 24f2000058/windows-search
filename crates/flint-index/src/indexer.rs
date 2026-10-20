@@ -9,6 +9,7 @@
 //! * Transient problems (volume unplugged, journal being deleted) never
 //!   overwrite the stored checkpoint; they are reported as runtime status.
 
+use crate::governor::Governor;
 use crate::model::*;
 use crate::snapshot;
 use crate::source::JournalSource;
@@ -22,6 +23,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub const ENUM_BATCH: usize = 50_000;
+/// Records applied per table write-lock acquisition, so searches running
+/// during a scan wait at most a few milliseconds for the lock.
+pub const LOCK_CHUNK: usize = 4096;
 pub const READ_BATCH: usize = 4096;
 const MAX_RESCANS_PER_SYNC: u32 = 3;
 const MAX_FOLLOWUP_ROUNDS: usize = 100_000;
@@ -76,6 +80,10 @@ pub struct VolumeIndexer {
     pub(crate) consistent: bool,
     /// Next synthetic FRN segment for traversal volumes (0 = not computed).
     pub(crate) synthetic_next: u64,
+    /// Paces heavy scans (None: run flat out, e.g. in tests and tools).
+    pub governor: Option<Arc<Governor>>,
+    /// True while waiting for another volume's scan to finish.
+    pub queued: Arc<AtomicBool>,
 }
 
 /// Where a volume's entries came from at startup.
@@ -109,7 +117,7 @@ impl VolumeIndexer {
                             Ok(base) => match VolumeIndex::adopt(&t, volume, root_frn, base, n) {
                                 Ok(index) => {
                                     drop(t);
-                                    let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats: Stats::default(), progress: Arc::default(), consistent: true, synthetic_next: 0 };
+                                    let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats: Stats::default(), progress: Arc::default(), consistent: true, synthetic_next: 0, governor: None, queued: Arc::default() };
                                     return Ok((ix, LoadSource::Snapshot));
                                 }
                                 Err(e) => {
@@ -136,7 +144,7 @@ impl VolumeIndexer {
         let mut stats = Stats::default();
         // A consistent store yields no orphans; any are repaired on sync.
         stats.inconsistencies += index.orphan_count() as u64;
-        let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: Arc::default(), consistent: true, synthetic_next: 0 };
+        let ix = VolumeIndexer { key: key.to_owned(), root_name: root_name.to_owned(), db_id, index, state, runtime: None, stats, progress: Arc::default(), consistent: true, synthetic_next: 0, governor: None, queued: Arc::default() };
         Ok((ix, LoadSource::Store { why }))
     }
 
@@ -222,6 +230,12 @@ impl VolumeIndexer {
     /// Clears the volume and streams a full enumeration into table + store
     /// in batches, then resolves parents still missing.
     fn enumerate_into(&mut self, src: &mut dyn JournalSource, store: &mut Store, table: &RwLock<NameTable>, cancel: &AtomicBool) -> Result<(), SyncError> {
+        let governor = self.governor.clone();
+        let queued = self.queued.clone();
+        let _permit = match &governor {
+            Some(g) => Some(g.acquire_scan(cancel, &mut |q| queued.store(q, Ordering::Relaxed)).ok_or(SyncError::Canceled)?),
+            None => None,
+        };
         self.index.clear(&mut table.write().unwrap());
         self.progress.store(0, Ordering::Relaxed);
 
@@ -232,9 +246,12 @@ impl VolumeIndexer {
         let (index, stats, progress) = (&mut self.index, &mut self.stats, self.progress.clone());
         let mut flush = |batch: &mut Vec<FileRecord>, store: &mut Store| -> Result<(), SyncError> {
             let mut ch = Changes::default();
-            {
+            for part in batch.chunks(LOCK_CHUNK) {
+                if let Some(g) = &governor {
+                    g.pace(cancel);
+                }
                 let mut t = table.write().unwrap();
-                for r in batch.iter() {
+                for r in part {
                     index.apply_record(&mut t, r, &mut ch);
                 }
             }
@@ -274,6 +291,12 @@ impl VolumeIndexer {
         ch.followups.extend(self.index.orphan_parents().into_iter().map(Followup::Parent));
         self.resolve_followups(src, table, &mut ch);
         store.commit(self.db_id, false, &ch.ops, None)?;
+        // A full scan grows the columns by doubling; return the slack
+        // (up to half of the table) now that the bulk load is over.
+        let mut t = table.write().unwrap();
+        if t.slack_bytes() > t.heap_bytes() / 8 {
+            t.shrink_to_fit();
+        }
         Ok(())
     }
 

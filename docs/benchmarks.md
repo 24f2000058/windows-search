@@ -11,10 +11,13 @@ Targets are hypotheses to measure, not guarantees. Every result file in
 | Hotkey → interactive ≤100 ms | not measured on Windows (Wine figures are not valid) | spike prints it |
 | UI input latency during indexing p95 ≤50 ms | not measured | spike prints keystroke → painted |
 | Idle CPU ≤0.5% over 5 min | not measured | protocol below |
-| Idle private bytes ≤50 MB (viewer off) | proxy: ~74 MB RSS at 1M entries on Linux; see decisions.md open item 4 | |
+| Idle private bytes ≤ 25 MB + 70 B/entry (ADR-013; was ≤50 MB) | name table 68 MB at 1M synthetic entries after `shrink_to_fit` (was ~102 MB committed); process total not yet measured on Windows (the launcher prints private bytes when hidden; Wine reports 0) | results/2026-10-20-linux-vm-memory.md |
 | Cached lightweight preview ≤50 ms | viewer not built | |
 
-## Reference-PC protocol (to run once the PC is specified)
+## Reference-PC protocol
+
+Reference PC class (ADR-013): Windows 10 22H2 or 11, 4 cores, 8 GB RAM, SATA
+SSD, 300k–1M files on the system volume, Balanced power plan, Defender on.
 
 Record CPU, RAM, storage, Windows build, power plan, AV state and file
 counts per volume.

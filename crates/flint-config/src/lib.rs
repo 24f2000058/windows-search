@@ -98,6 +98,13 @@ pub struct Indexing {
     pub extra_roots: Vec<String>,
     /// Background size/date refresh budget.
     pub metadata_refresh_per_second: u32,
+    /// Run indexing threads at background priority (low CPU, I/O and memory
+    /// priority; EcoQoS on Windows 11).
+    pub background_priority: bool,
+    /// Volumes scanned at the same time (full scans are disk-heavy).
+    pub concurrent_scans: u32,
+    /// Pause indexing briefly while the user is typing in the launcher.
+    pub pause_while_typing: bool,
 }
 
 impl Default for Indexing {
@@ -110,6 +117,9 @@ impl Default for Indexing {
             excluded_paths: Vec::new(),
             extra_roots: Vec::new(),
             metadata_refresh_per_second: 2000,
+            background_priority: true,
+            concurrent_scans: 1,
+            pause_while_typing: true,
         }
     }
 }
@@ -169,6 +179,37 @@ pub struct Plugins {
     pub enabled: bool,
 }
 
+/// What happens when a copied or moved item's name exists at the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnCollision {
+    /// The Windows conflict dialog asks per item.
+    #[default]
+    Ask,
+    /// Keep both (the new item gets a numbered name).
+    KeepBoth,
+    Skip,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Files {
+    pub on_collision: OnCollision,
+    /// Ask before moving even a single item to the Recycle Bin (batches,
+    /// permanent deletes and anything with warnings are always confirmed).
+    pub confirm_recycle: bool,
+    /// Bytes read per file by "Compare".
+    pub compare_limit_mb: u64,
+    /// Total bytes read by "Find duplicates".
+    pub duplicate_limit_mb: u64,
+}
+
+impl Default for Files {
+    fn default() -> Self {
+        Files { on_collision: OnCollision::Ask, confirm_recycle: false, compare_limit_mb: 4096, duplicate_limit_mb: 2048 }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -181,6 +222,7 @@ pub struct Config {
     pub privacy: Privacy,
     pub updates: Updates,
     pub plugins: Plugins,
+    pub files: Files,
 }
 
 impl Default for Config {
@@ -195,11 +237,12 @@ impl Default for Config {
             privacy: Privacy::default(),
             updates: Updates::default(),
             plugins: Plugins::default(),
+            files: Files::default(),
         }
     }
 }
 
-const SECTIONS: &[&str] = &["general", "search", "indexing", "web_search", "viewer", "privacy", "updates", "plugins"];
+const SECTIONS: &[&str] = &["general", "search", "indexing", "web_search", "viewer", "privacy", "updates", "plugins", "files"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Note {
@@ -389,6 +432,7 @@ fn load_with(path: &Path, migrations: &[Migration]) -> Loaded {
         privacy: section(&table, "privacy", &mut notes),
         updates: section(&table, "updates", &mut notes),
         plugins: section(&table, "plugins", &mut notes),
+        files: section(&table, "files", &mut notes),
     };
     let fixes = config.validate();
     needs_save |= !fixes.is_empty() || notes.iter().any(|n| matches!(n, Note::SectionReset { .. }));

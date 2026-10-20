@@ -5,6 +5,7 @@
 //! renaming or moving a directory is O(1) regardless of subtree size.
 
 use crate::fold::{fold_str, mask_of};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub type EntryId = u32;
@@ -25,6 +26,18 @@ pub mod flags {
 /// Unknown modification time.
 pub const NO_TIME: i64 = i64::MIN;
 
+/// Longest name a slot can hold, in UTF-8 bytes. NTFS allows 255 UTF-16
+/// units (at most 765 bytes); the top bit of the stored folded length is used
+/// as a flag.
+pub const MAX_NAME_BYTES: usize = 0x7FFF;
+/// Stored folded length flag: the folded name follows the display name in
+/// the arena (otherwise it is the display name itself).
+const FOLDED_SEPARATE: u16 = 0x8000;
+/// Stored times are u32 seconds since 1970 (until 2106); these two values
+/// mean "unknown" and "see `wide_times`" respectively.
+const T_NONE: u32 = u32::MAX;
+const T_WIDE: u32 = u32::MAX - 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Meta {
     pub size: u64,
@@ -43,6 +56,9 @@ impl Meta {
     }
 }
 
+/// Columnar layout, ~43 bytes per slot plus name bytes (see ADR-013). The
+/// folded name has no offset column: it is either the display name itself or
+/// stored directly after it.
 #[derive(Default)]
 pub struct NameTable {
     /// UTF-8 name bytes. Invariant: every (offset, len) span stored in this
@@ -50,12 +66,14 @@ pub struct NameTable {
     arena: Vec<u8>,
     name_off: Vec<u32>,
     name_len: Vec<u16>,
-    folded_off: Vec<u32>,
+    /// Folded byte length, with [`FOLDED_SEPARATE`] set when it differs.
     folded_len: Vec<u16>,
     parent: Vec<EntryId>,
     mask: Vec<u64>,
     size: Vec<u64>,
-    mtime: Vec<i64>,
+    mtime: Vec<u32>,
+    /// Exact times outside the u32 range (pre-1970 or after 2106); rare.
+    wide_times: HashMap<EntryId, i64>,
     flags: Vec<u8>,
     volume: Vec<u16>,
     /// Opaque source identity per slot (e.g. NTFS file reference number).
@@ -89,18 +107,55 @@ impl NameTable {
         self.generation
     }
 
-    fn intern(&mut self, name: &str) -> (u32, u16, u32, u16) {
-        assert!(name.len() <= u16::MAX as usize, "name too long");
-        assert!(self.arena.len() + 2 * name.len() < u32::MAX as usize, "name arena full");
+    /// Appends a name (and its folded form when different) to the arena,
+    /// returning (offset, name length, stored folded length).
+    fn intern(&mut self, name: &str) -> (u32, u16, u16) {
+        let folded = fold_str(name);
+        self.intern_folded(name, &folded)
+    }
+
+    fn intern_folded(&mut self, name: &str, folded: &str) -> (u32, u16, u16) {
+        assert!(name.len() <= MAX_NAME_BYTES && folded.len() <= MAX_NAME_BYTES, "name too long");
+        assert!(self.arena.len() + name.len() + folded.len() < u32::MAX as usize, "name arena full");
         let off = self.arena.len() as u32;
         self.arena.extend_from_slice(name.as_bytes());
-        let folded = fold_str(name);
         if folded == name {
-            (off, name.len() as u16, off, name.len() as u16)
+            (off, name.len() as u16, name.len() as u16)
         } else {
-            let foff = self.arena.len() as u32;
             self.arena.extend_from_slice(folded.as_bytes());
-            (off, name.len() as u16, foff, folded.len() as u16)
+            (off, name.len() as u16, folded.len() as u16 | FOLDED_SEPARATE)
+        }
+    }
+
+    #[inline]
+    fn folded_span(&self, i: usize) -> (u32, u16) {
+        let fl = self.folded_len[i];
+        if fl & FOLDED_SEPARATE != 0 {
+            (self.name_off[i] + self.name_len[i] as u32, fl & !FOLDED_SEPARATE)
+        } else {
+            (self.name_off[i], fl)
+        }
+    }
+
+    fn store_time(&mut self, id: EntryId, t: i64) -> u32 {
+        if t == NO_TIME {
+            self.wide_times.remove(&id);
+            T_NONE
+        } else if (0..T_WIDE as i64).contains(&t) {
+            self.wide_times.remove(&id);
+            t as u32
+        } else {
+            self.wide_times.insert(id, t);
+            T_WIDE
+        }
+    }
+
+    #[inline]
+    fn load_time(&self, i: usize) -> i64 {
+        match self.mtime[i] {
+            T_NONE => NO_TIME,
+            T_WIDE => self.wide_times.get(&(i as EntryId)).copied().unwrap_or(NO_TIME),
+            t => t as i64,
         }
     }
 
@@ -120,15 +175,16 @@ impl NameTable {
     pub fn push_keyed(&mut self, parent: EntryId, name: &str, meta: Meta, key: u64) -> EntryId {
         let id = self.parent.len() as EntryId;
         assert!(id != NO_PARENT, "table full");
-        let (no, nl, fo, fl) = self.intern(name);
+        let (no, nl, fl) = self.intern(name);
         self.name_off.push(no);
         self.name_len.push(nl);
-        self.folded_off.push(fo);
         self.folded_len.push(fl);
+        let (fo, fl) = self.folded_span(id as usize);
         self.mask.push(mask_of(self.span(fo, fl)));
         self.parent.push(parent);
         self.size.push(meta.size);
-        self.mtime.push(meta.mtime);
+        let t = self.store_time(id, meta.mtime);
+        self.mtime.push(t);
         self.flags.push(meta.flags & !flags::DEAD);
         self.volume.push(meta.volume);
         self.key.push(key);
@@ -152,11 +208,11 @@ impl NameTable {
         let i = id as usize;
         if self.name(id) != name {
             self.dead_bytes += self.name_len[i] as usize;
-            let (no, nl, fo, fl) = self.intern(name);
+            let (no, nl, fl) = self.intern(name);
             self.name_off[i] = no;
             self.name_len[i] = nl;
-            self.folded_off[i] = fo;
             self.folded_len[i] = fl;
+            let (fo, fl) = self.folded_span(i);
             self.mask[i] = mask_of(self.span(fo, fl));
         }
         self.parent[i] = parent;
@@ -168,7 +224,7 @@ impl NameTable {
         let dead = self.flags[i] & flags::DEAD;
         let dir_changed = (self.flags[i] ^ meta.flags) & flags::DIR != 0;
         self.size[i] = meta.size;
-        self.mtime[i] = meta.mtime;
+        self.mtime[i] = self.store_time(id, meta.mtime);
         self.flags[i] = (meta.flags & !flags::DEAD) | dead;
         self.volume[i] = meta.volume;
         self.touch(dir_changed);
@@ -193,8 +249,8 @@ impl NameTable {
     }
     #[inline]
     pub fn folded(&self, id: EntryId) -> &str {
-        let i = id as usize;
-        self.span(self.folded_off[i], self.folded_len[i])
+        let (fo, fl) = self.folded_span(id as usize);
+        self.span(fo, fl)
     }
     #[inline]
     pub fn parent(&self, id: EntryId) -> EntryId {
@@ -207,7 +263,7 @@ impl NameTable {
     #[inline]
     pub fn meta(&self, id: EntryId) -> Meta {
         let i = id as usize;
-        Meta { size: self.size[i], mtime: self.mtime[i], flags: self.flags[i], volume: self.volume[i] }
+        Meta { size: self.size[i], mtime: self.load_time(i), flags: self.flags[i], volume: self.volume[i] }
     }
     #[inline]
     pub fn flags(&self, id: EntryId) -> u8 {
@@ -345,21 +401,21 @@ impl NameTable {
             let i = id as usize;
             let name_off = c.arena.len() as u32;
             c.arena.extend_from_slice(self.name(id).as_bytes());
-            let folded_off = if self.folded_off[i] == self.name_off[i] {
-                name_off
+            let (folded_off, folded_len) = if self.folded_len[i] & FOLDED_SEPARATE == 0 {
+                (name_off, self.folded_len[i])
             } else {
                 let o = c.arena.len() as u32;
                 c.arena.extend_from_slice(self.folded(id).as_bytes());
-                o
+                (o, self.folded_len[i] & !FOLDED_SEPARATE)
             };
             c.slots.push(ChunkSlot {
                 name_off,
                 name_len: self.name_len[i],
                 folded_off,
-                folded_len: self.folded_len[i],
+                folded_len,
                 parent: local.get(&self.parent[i]).copied().unwrap_or(NO_PARENT),
                 size: self.size[i],
-                mtime: self.mtime[i],
+                mtime: self.load_time(i),
                 flags: self.flags[i],
                 key: self.key[i],
             });
@@ -379,6 +435,9 @@ impl NameTable {
         }
         for (i, s) in c.slots.iter().enumerate() {
             for (off, len) in [(s.name_off, s.name_len), (s.folded_off, s.folded_len)] {
+                if len as usize > MAX_NAME_BYTES {
+                    return Err(ChunkError::BadSpan(i));
+                }
                 let bytes = c.arena.get(off as usize..off as usize + len as usize).ok_or(ChunkError::BadSpan(i))?;
                 std::str::from_utf8(bytes).map_err(|_| ChunkError::BadUtf8(i))?;
             }
@@ -389,11 +448,9 @@ impl NameTable {
                 return Err(ChunkError::DeadSlot(i));
             }
         }
-        let abase = self.arena.len() as u32;
-        self.arena.extend_from_slice(&c.arena);
+        self.arena.reserve(c.arena.len());
         self.name_off.reserve(n);
         self.name_len.reserve(n);
-        self.folded_off.reserve(n);
         self.folded_len.reserve(n);
         self.parent.reserve(n);
         self.size.reserve(n);
@@ -402,20 +459,29 @@ impl NameTable {
         self.volume.reserve(n);
         self.key.reserve(n);
         self.mask.reserve(n);
-        for s in &c.slots {
-            self.name_off.push(abase + s.name_off);
-            self.name_len.push(s.name_len);
-            self.folded_off.push(abase + s.folded_off);
-            self.folded_len.push(s.folded_len);
+        let text = |off: u32, len: u16| {
+            // SAFETY: every span was bounds- and UTF-8-checked above.
+            unsafe { std::str::from_utf8_unchecked(&c.arena[off as usize..off as usize + len as usize]) }
+        };
+        for (k, s) in c.slots.iter().enumerate() {
+            let id = (base + k) as EntryId;
+            // Re-interned (not bulk-copied) so the folded name sits directly
+            // after the display name, which is what the layout relies on.
+            let (no, nl, fl) = self.intern_folded(text(s.name_off, s.name_len), text(s.folded_off, s.folded_len));
+            self.name_off.push(no);
+            self.name_len.push(nl);
+            self.folded_len.push(fl);
             self.parent.push(if s.parent == NO_PARENT { NO_PARENT } else { base as EntryId + s.parent });
             self.size.push(s.size);
-            self.mtime.push(s.mtime);
+            let t = self.store_time(id, s.mtime);
+            self.mtime.push(t);
             self.flags.push(s.flags);
             self.volume.push(volume);
             self.key.push(s.key);
             // Recomputed rather than trusted: a wrong mask would silently
             // hide matches.
-            let m = mask_of(self.span(abase + s.folded_off, s.folded_len));
+            let (fo, fl) = self.folded_span(id as usize);
+            let m = mask_of(self.span(fo, fl));
             self.mask.push(m);
         }
         self.live += n;
@@ -423,12 +489,40 @@ impl NameTable {
         Ok(base as EntryId)
     }
 
-    /// Approximate heap bytes used by the table.
+    /// Bytes per slot in the fixed-width columns.
+    pub const SLOT_BYTES: usize = 4 + 2 + 2 + 4 + 8 + 8 + 4 + 1 + 2 + 8;
+
+    /// Approximate heap bytes used by the table (by capacity, which is what
+    /// Windows commits).
     pub fn heap_bytes(&self) -> usize {
         self.arena.capacity()
-            + self.parent.capacity() * (4 + 4 + 2 + 4 + 2 + 8 + 8 + 8 + 1 + 2 + 8)
+            + self.parent.capacity() * Self::SLOT_BYTES
+            + self.wide_times.capacity() * 16
             + self.chain_cache.lock().unwrap().as_ref().map_or(0, |c| c.len() * 8)
             + self.dir_cache.lock().unwrap().as_ref().map_or(0, |d| d.dirs.len() * 20 + d.names.len() + d.ord.len() * 4)
+    }
+
+    /// Releases spare capacity left by `Vec` growth (up to half of each
+    /// column right after a large scan). Called once a bulk load settles;
+    /// costs one copy of each column.
+    pub fn shrink_to_fit(&mut self) {
+        self.arena.shrink_to_fit();
+        self.name_off.shrink_to_fit();
+        self.name_len.shrink_to_fit();
+        self.folded_len.shrink_to_fit();
+        self.parent.shrink_to_fit();
+        self.mask.shrink_to_fit();
+        self.size.shrink_to_fit();
+        self.mtime.shrink_to_fit();
+        self.wide_times.shrink_to_fit();
+        self.flags.shrink_to_fit();
+        self.volume.shrink_to_fit();
+        self.key.shrink_to_fit();
+    }
+
+    /// Spare capacity in bytes (what [`shrink_to_fit`](Self::shrink_to_fit) would release).
+    pub fn slack_bytes(&self) -> usize {
+        (self.arena.capacity() - self.arena.len()) + (self.parent.capacity() - self.parent.len()) * Self::SLOT_BYTES
     }
 
     /// Bytes of names that are no longer referenced (compaction hint).
@@ -566,6 +660,47 @@ mod tests {
         bad.slots[2].name_len = 9999;
         assert_eq!(u.import_chunk(0, &bad), Err(ChunkError::BadSpan(2)));
         assert_eq!(u.len(), before, "rejected chunks leave the table untouched");
+    }
+
+    #[test]
+    fn times_are_exact_across_the_compact_range() {
+        let mut t = NameTable::new();
+        let r = t.push(NO_PARENT, "C:", Meta::dir(0));
+        for mtime in [0, 1, 1_700_000_000, T_WIDE as i64 - 1, T_WIDE as i64, u32::MAX as i64, -1, -11_644_473_600, i64::MAX, NO_TIME] {
+            let f = t.push(r, "f", Meta::file(0, 1, mtime));
+            assert_eq!(t.meta(f).mtime, mtime);
+            t.set_meta(f, Meta::file(0, 1, 5));
+            assert_eq!(t.meta(f).mtime, 5);
+            t.set_meta(f, Meta::file(0, 1, mtime));
+            assert_eq!(t.meta(f).mtime, mtime, "set_meta round trip");
+            let c = t.export_volume(0);
+            let mut u = NameTable::new();
+            let base = u.import_chunk(0, &c).unwrap();
+            assert!((0..c.slots.len() as EntryId).any(|k| u.meta(base + k).mtime == mtime), "chunk round trip {mtime}");
+        }
+    }
+
+    #[test]
+    fn folded_names_survive_renames_and_shrinking() {
+        let mut t = NameTable::new();
+        let r = t.push(NO_PARENT, "C:", Meta::dir(0));
+        let a = t.push(r, "lower.txt", Meta::file(0, 1, 1));
+        let b = t.push(r, "Ünïcode.TXT", Meta::file(0, 1, 1));
+        assert_eq!(t.folded(a), "lower.txt");
+        assert_eq!(t.folded(b), fold_str("Ünïcode.TXT"));
+        t.rename(a, r, "Now Upper");
+        t.rename(b, r, "now lower");
+        assert_eq!((t.name(a), t.folded(a)), ("Now Upper", "now upper"));
+        assert_eq!((t.name(b), t.folded(b)), ("now lower", "now lower"));
+        for i in 0..1000 {
+            t.push(r, &format!("F{i}"), Meta::file(0, 1, 1));
+        }
+        let before = t.heap_bytes();
+        t.shrink_to_fit();
+        assert_eq!(t.slack_bytes(), 0);
+        assert!(t.heap_bytes() <= before);
+        assert_eq!(t.folded(a), "now upper");
+        assert_eq!(t.path(b), "C:\\now lower");
     }
 
     #[test]

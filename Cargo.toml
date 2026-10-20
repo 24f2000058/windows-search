@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/24f2000058/windows-search"
 rust-version = "1.80"
 
 [profile.release]

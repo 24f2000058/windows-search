@@ -13,7 +13,8 @@ These need Windows hardware:
 - [ ] Measure the spike against the UI targets, prototype at least one
   framework, and close ADR-002.
 - [ ] Windows CI (MSVC build + tests); compile-only checks run here today.
-- [ ] Owner decisions: ADR-005 scope, reference PC, name/license.
+- [ ] Owner decisions: ADR-005 scope, final name (reference PC and license
+  decided: ADR-013).
 
 ## Phase 2: launcher and indexing — done (pending hardware validation)
 
@@ -40,20 +41,39 @@ Remaining from phase 2:
 - [ ] Hardware validation of everything marked Prototype (`ntfs_probe`,
   Windows CI).
 
-## Phase 3: search UX and file operations
+## Phase 3: search UX and file operations — done (pending hardware validation)
 
-1. "Show weaker matches" / "show remaining candidates" actions, wired to
-   `Options::through` and `exhaustive`.
-2. Filters: local-time dates, a size/date UI, and exposing weak-match tiers
-   in the UI.
-3. File operations via `IFileOperation`:
-   * revalidate by FRN and path right before acting
-   * Recycle Bin by default, explicit permanent delete
-   * batch preview, collision handling
-4. Native shell context menu (`IContextMenu`, keeping third-party
-   extensions) alongside a custom menu. Open with, properties, compare,
-   optional duplicate detection.
-5. Fault-injection tests for destructive-operation races.
+Done (see requirements.md for evidence):
+
+- [x] "Search deeper" (F3): weaker matches, then all remaining indexed
+  candidates; weak rows labelled; the status line offers it only when it
+  applies.
+- [x] Filters: local-time, DST-correct dates; strict `>`/`<`; filter bar
+  (type, size, date) that edits the query; size, modified and match
+  columns.
+- [x] File operations (`flint-ops`, ADR-015):
+  * plan, reviewed preview, final revalidation (FRN or
+    type/size/mtime), `IFileOperation`, verify by observation
+  * Recycle Bin by default; permanent delete only with explicit
+    confirmation
+  * collisions configurable; batch preview
+- [x] Custom menu above the native shell menu (`IContextMenu2/3`
+  forwarding), with native delete/rename intercepted. Open, open with,
+  reveal, copy/cut/paste, copy path, rename, move/copy to, new folder,
+  properties, compare, duplicates.
+- [x] Fault-injection tests for destructive-operation races.
+- [x] Owner decisions recorded: reference PC, memory budget, license
+  (ADR-013).
+- [x] Background indexing governance (ADR-014) and a compact name table
+  (68 B/entry at 1M entries, down from ~102 MB committed).
+
+Remaining from phase 3:
+
+- [ ] Run `ops_probe.exe` and the launcher on Windows. Check the Recycle
+  Bin, conflict dialogs and third-party menu extensions.
+- [ ] Measure the ADR-013 memory budget and ADR-014 pacing on the
+  reference PC.
+- [ ] Drag and drop out of the result list.
 
 ## Phase 4: viewer, content and deep search
 

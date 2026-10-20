@@ -5,7 +5,9 @@
 //! * `type:file|folder|image|video|audio|doc|archive|code|exe`
 //! * `size:>10mb`, `size:<1kb`, `size:1mb..1gb`, `size:empty`
 //! * `modified:>2024-01-01`, `modified:2024-01-01..2024-06-30`,
-//!   `modified:today|yesterday|week|month|year` (alias `dm:`)
+//!   `modified:today|yesterday|week|month|year` (alias `dm:`). Dates are
+//!   calendar days in the user's local time zone (see [`Clock`]), including
+//!   23- and 25-hour days at daylight-saving changes.
 //! * `path:text` — folded substring of the containing directory path
 //! * `content:text` — requires the content index (reported as unavailable if
 //!   the caller has none; never silently ignored)
@@ -134,9 +136,32 @@ fn parse_date(s: &str) -> Option<i64> {
     Some(days_from_civil(y, m, d) * 86_400)
 }
 
+/// Integer neighbours, so strict comparisons become inclusive bounds.
+trait Step: Copy {
+    fn succ(self) -> Self;
+    fn pred(self) -> Self;
+}
+impl Step for u64 {
+    fn succ(self) -> Self {
+        self.saturating_add(1)
+    }
+    fn pred(self) -> Self {
+        self.saturating_sub(1)
+    }
+}
+impl Step for i64 {
+    fn succ(self) -> Self {
+        self.saturating_add(1)
+    }
+    fn pred(self) -> Self {
+        self.saturating_sub(1)
+    }
+}
+
 /// Parses `>a`, `<a`, `>=a`, `<=a`, `a..b`, or `a` into an inclusive range,
-/// with `exact` deciding what a bare value means.
-fn parse_range<T: Copy + Ord>(s: &str, min: T, max: T, parse: impl Fn(&str) -> Option<T>, exact: impl Fn(T) -> (T, T)) -> Option<(T, T)> {
+/// with `exact` deciding what a bare value covers (a size is one value, a
+/// date a whole day). `>` and `<` are strict.
+fn parse_range<T: Step + Ord>(s: &str, min: T, max: T, parse: impl Fn(&str) -> Option<T>, exact: impl Fn(T) -> (T, T)) -> Option<(T, T)> {
     if let Some((a, b)) = s.split_once("..") {
         let lo = if a.is_empty() { min } else { parse(a)? };
         let hi = if b.is_empty() { max } else { exact(parse(b)?).1 };
@@ -148,16 +173,60 @@ fn parse_range<T: Copy + Ord>(s: &str, min: T, max: T, parse: impl Fn(&str) -> O
             return Some(match f {
                 0 => (exact(v).0, max),
                 1 => (min, exact(v).1),
-                2 => (exact(v).1, max),
-                _ => (min, exact(v).0),
+                2 => (exact(v).1.succ(), max),
+                _ => (min, exact(v).0.pred()),
             });
         }
     }
     Some(exact(parse(s)?))
 }
 
-/// Parses a raw query. `now` (unix seconds) anchors relative dates.
+/// Local time zone as a function from a UTC instant (unix seconds) to the
+/// offset in seconds that local wall-clock time had at that instant.
+pub type UtcOffset = dyn Fn(i64) -> i64 + Send + Sync;
+
+/// What date filters are interpreted against.
+pub struct Clock<'a> {
+    /// Unix seconds (UTC).
+    pub now: i64,
+    pub offset: &'a UtcOffset,
+}
+
+impl Clock<'_> {
+    /// UTC instant of a local wall-clock time. Wall-clock times skipped by a
+    /// DST change map to just after it; repeated ones to the first instance.
+    pub fn to_utc(&self, local: i64) -> i64 {
+        let guess = local - (self.offset)(local);
+        let fixed = local - (self.offset)(guess);
+        // The second probe settles every transition; prefer the earlier
+        // instant when both are valid (repeated hour).
+        if guess != fixed && local - (self.offset)(fixed) == fixed { fixed.min(guess) } else { fixed }
+    }
+    pub fn to_local(&self, utc: i64) -> i64 {
+        utc + (self.offset)(utc)
+    }
+}
+
+fn utc_offset(_: i64) -> i64 {
+    0
+}
+
+/// Parses a raw query with dates in UTC. `now` (unix seconds) anchors
+/// relative dates. The launcher uses [`parse_with`] and the local zone.
 pub fn parse(raw: &str, now: i64) -> Query {
+    parse_with(raw, &Clock { now, offset: &utc_offset })
+}
+
+/// Converts an inclusive range of local seconds to UTC, keeping open ends.
+fn local_range(c: &Clock, (lo, hi): (i64, i64)) -> (i64, i64) {
+    let lo = if lo <= i64::MIN + 1 { lo } else { c.to_utc(lo) };
+    let hi = if hi == i64::MAX { hi } else { c.to_utc(hi + 1) - 1 };
+    (lo, hi)
+}
+
+/// Parses a raw query; calendar dates are local days of `clock`.
+pub fn parse_with(raw: &str, clock: &Clock) -> Query {
+    let now = clock.now;
     let mut q = Query { raw: raw.to_owned(), ..Default::default() };
     for (term, quoted, lead_quote) in split_terms(raw) {
         let lower = term.to_ascii_lowercase();
@@ -203,14 +272,15 @@ pub fn parse(raw: &str, now: i64) -> Query {
                     }
                     "modified" | "dm" | "date" => {
                         let day = 86_400;
-                        let today = now.div_euclid(day) * day;
+                        // Local midnight today, in local seconds.
+                        let today = clock.to_local(now).div_euclid(day) * day;
                         let r = match v {
-                            "today" => Some((today, i64::MAX)),
-                            "yesterday" => Some((today - day, today - 1)),
+                            "today" => Some(local_range(clock, (today, i64::MAX))),
+                            "yesterday" => Some(local_range(clock, (today - day, today - 1))),
                             "week" => Some((now - 7 * day, i64::MAX)),
                             "month" => Some((now - 30 * day, i64::MAX)),
                             "year" => Some((now - 365 * day, i64::MAX)),
-                            _ => parse_range(v, i64::MIN + 1, i64::MAX, parse_date, |d| (d, d + day - 1)),
+                            _ => parse_range(v, i64::MIN + 1, i64::MAX, parse_date, |d| (d, d + day - 1)).map(|r| local_range(clock, r)),
                         };
                         match r {
                             Some((a, b)) => q.filters.push(Filter::Modified(a, b)),
@@ -258,7 +328,8 @@ mod tests {
         let q = parse(r#"Annual "Q3 Report" ext:pdf,DOCX size:>1mb type:doc"#, 0);
         assert_eq!(q.tokens, vec!["annual", "q3 report"]);
         assert_eq!(q.filters[0], Filter::Ext(vec!["pdf".into(), "docx".into()]));
-        assert_eq!(q.filters[1], Filter::Size(1_048_576, u64::MAX));
+        assert_eq!(q.filters[1], Filter::Size(1_048_577, u64::MAX), "> is strict");
+        assert_eq!(parse("size:>=1kb size:<1kb size:<=1kb", 0).filters, vec![Filter::Size(1024, u64::MAX), Filter::Size(0, 1023), Filter::Size(0, 1024)]);
         assert!(matches!(q.filters[2], Filter::Kind(Kind::Extensions(_))));
         assert!(q.errors.is_empty());
     }
@@ -288,6 +359,31 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         let q = parse("dm:2024-13-01 size:huge type:nope", 0);
         assert_eq!(q.errors.len(), 3);
+    }
+
+    #[test]
+    fn dates_are_local_days_including_dst_changes() {
+        let day = 86_400;
+        // A zone at UTC+1 that moves to UTC+2 at 2024-03-31 01:00 UTC (EU rule).
+        let switch = days_from_civil(2024, 3, 31) * day + 3600;
+        let eu = move |t: i64| if t >= switch { 7200 } else { 3600 };
+        let clock = Clock { now: days_from_civil(2024, 3, 31) * day + 12 * 3600, offset: &eu };
+        let q = parse_with("modified:2024-03-31", &clock);
+        let midnight_utc = days_from_civil(2024, 3, 31) * day - 3600; // 00:00 at +1
+        let next_midnight_utc = days_from_civil(2024, 4, 1) * day - 7200; // 00:00 at +2
+        assert_eq!(q.filters[0], Filter::Modified(midnight_utc, next_midnight_utc - 1), "a 23-hour local day");
+        let q = parse_with("modified:today", &clock);
+        assert_eq!(q.filters[0], Filter::Modified(midnight_utc, i64::MAX));
+        let q = parse_with("modified:yesterday", &clock);
+        assert_eq!(q.filters[0], Filter::Modified(days_from_civil(2024, 3, 30) * day - 3600, midnight_utc - 1));
+        let q = parse_with("modified:<2024-01-01", &clock);
+        assert_eq!(q.filters[0], Filter::Modified(i64::MIN + 1, days_from_civil(2024, 1, 1) * day - 3600 - 1));
+        // Round trips away from the transition.
+        for t in [0, switch - 7200, switch + 7200, 1_800_000_000] {
+            assert_eq!(clock.to_utc(clock.to_local(t)), t);
+        }
+        // UTC parse is unchanged.
+        assert_eq!(parse("modified:2024-03-31", 0).filters[0], Filter::Modified(days_from_civil(2024, 3, 31) * day, days_from_civil(2024, 4, 1) * day - 1));
     }
 
     #[test]

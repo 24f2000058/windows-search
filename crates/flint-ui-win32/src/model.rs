@@ -1,7 +1,7 @@
 //! Platform-neutral UI state: result list with stable selection, stale-event
 //! rejection, user-facing status text and latency statistics.
 
-use flint_fuzzy::engine::{Hit, SearchResult, Stage, Status, Stop};
+use flint_fuzzy::engine::{Hit, SearchResult, Status, Stop};
 use flint_fuzzy::table::EntryId;
 
 #[derive(Default)]
@@ -51,8 +51,8 @@ impl ResultsModel {
 pub use flint_index::catalog::Coverage;
 
 /// One-line status that never conflates "nothing matched" with "we did not
-/// look everywhere".
-pub fn status_line(s: &Status, shown: usize, cov: &Coverage) -> String {
+/// look everywhere". `deeper` is the search-deeper step on offer, if any.
+pub fn status_line(s: &Status, shown: usize, cov: &Coverage, deeper: Option<crate::ux::Deeper>) -> String {
     let mut parts = Vec::new();
     match s.stop {
         Stop::Canceled => parts.push("search canceled".to_owned()),
@@ -79,11 +79,10 @@ pub fn status_line(s: &Status, shown: usize, cov: &Coverage) -> String {
         if let Some(top) = s.stages.last() {
             parts.push(format!("through: {}", top.stage.label()));
         }
-        match s.stop {
-            Stop::Enough { next } if next <= Stage::Weak => parts.push("weaker matches available".into()),
-            Stop::Enough { .. } => parts.push("remaining candidates available".into()),
-            _ if s.indexed_exhausted => parts.push("all indexed entries examined".into()),
-            _ => {}
+        if s.indexed_exhausted {
+            parts.push("all indexed entries examined".into());
+        } else if let Some(d) = deeper {
+            parts.push(d.hint().into());
         }
     }
     if !s.query_errors.is_empty() {
@@ -169,19 +168,19 @@ mod tests {
         let complete = Coverage { complete: true, loading: false, problems: vec![] };
         let partial = Coverage { complete: false, loading: false, problems: vec!["D: indexing 40%".into()] };
         let loading = Coverage { complete: false, loading: true, problems: vec!["C: loading index".into()] };
-        assert!(status_line(&r.status, 0, &loading).starts_with("no matches yet — index still loading"));
-        assert!(status_line(&r.status, 0, &complete).starts_with("no matches"));
-        let s = status_line(&r.status, 0, &partial);
+        assert!(status_line(&r.status, 0, &loading, None).starts_with("no matches yet — index still loading"));
+        assert!(status_line(&r.status, 0, &complete, None).starts_with("no matches"));
+        let s = status_line(&r.status, 0, &partial, None);
         assert!(s.contains("no matches") && s.contains("index incomplete: D: indexing 40%"), "{s}");
         let ex = run(&t, "zzzzqqq", &Options { exhaustive: true, ..Default::default() });
-        let s = status_line(&ex.status, ex.hits.len(), &partial);
+        let s = status_line(&ex.status, ex.hits.len(), &partial, None);
         assert!(s.contains("all indexed entries examined") && s.contains("index incomplete"), "{s}");
         let c = CancelToken::new();
         c.cancel();
         let canceled = search(&t, &parse("rep", 0), &Options::default(), &c, |_| {});
-        assert!(status_line(&canceled.status, 0, &complete).starts_with("search canceled"));
+        assert!(status_line(&canceled.status, 0, &complete, None).starts_with("search canceled"));
         let unsupported = run(&t, "content:x", &Options::default());
-        assert!(status_line(&unsupported.status, 0, &complete).contains("not available yet: content:x"));
+        assert!(status_line(&unsupported.status, 0, &complete, None).contains("not available yet: content:x"));
     }
 }
 

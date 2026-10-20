@@ -2,6 +2,7 @@
 //! journal application, SQLite persistence, recovery and coverage reporting.
 
 pub mod catalog;
+pub mod governor;
 pub mod indexer;
 pub mod model;
 pub mod reconcile;

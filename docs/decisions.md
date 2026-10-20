@@ -64,10 +64,14 @@ high-contrast.
 
 **Design.** One `NameTable` with one slot per name link. Columns:
 
-* names (shared arena, folded copy only when different)
+* names (shared arena, folded copy only when different, stored right after
+  the display name so it needs no offset column)
 * parent id
 * a 64-bit character-presence mask
-* size, mtime, flags, volume and source key
+* size, mtime (u32 seconds, exact side table for out-of-range times),
+  flags, volume and source key
+
+That is 43 bytes of fixed columns per slot plus name bytes (ADR-013).
 
 Paths are reconstructed from parent links, so a directory move is O(1).
 
@@ -278,16 +282,162 @@ the generic application icon.
 * Excluded paths are honoured by walks and reconciliation. **Gap:**
   journal volumes still index excluded paths (open item).
 
+## ADR-013 Reference PC, memory budget and license — Accepted (owner input)
+
+The owner specified the reference PC and asked for low memory use and an
+open-source project.
+
+**Reference PC class.** Any standard Windows 10 (22H2) or Windows 11
+machine with **8 GB RAM**. Performance is measured on a modest example of
+that class, not a developer workstation:
+
+* 4 cores (e.g. Core i5 8th gen or Ryzen 5 2000 series)
+* 8 GB RAM, SATA SSD (one HDD run for disk-contention behaviour)
+* 300k–1M files on the system volume
+* Balanced power plan, Defender enabled
+
+**Memory budget.** An in-memory index costs memory per file, so a flat
+50 MB idle target cannot hold for 1M files. The budget is:
+
+* **Idle** (window hidden, no scan running, viewer off): private bytes
+  ≤ **25 MB + 70 bytes per indexed entry**. That is about 60 MB at 500k
+  entries and 95 MB at 1M, which is 1.2% of 8 GB.
+* **While scanning:** bounded by one scan at a time (ADR-014).
+
+Measured so far (Linux, 1M synthetic entries; Windows numbers pending):
+
+| Version | Name table |
+|---|---|
+| Before | ~102 MB committed (75 B/entry plus up to 50% `Vec` growth slack) |
+| Now | 68 MB (68 B/entry: 43 B fixed columns plus name bytes) |
+
+Changes that produced this:
+
+* folded names stored without an offset column (−4 B/entry)
+* times stored as u32 seconds, exact via a side table for out-of-range
+  values (−4 B/entry)
+* `shrink_to_fit` after every bulk load or scan, which returns the growth
+  slack. This matters on Windows, where capacity is committed memory.
+
+Derived search caches (chain masks: 8 B/entry; directory index) are
+dropped whenever the window hides.
+
+Further options, to apply if hardware measurements exceed the budget:
+
+* Real Windows names are mostly mixed case, so the folded copy roughly
+  doubles name bytes. An ASCII case bitmap instead could save an estimated
+  10–15 B/entry on real data.
+* A 40-bit size column (−3 B/entry).
+
+**License.** Dual **MIT OR Apache-2.0**, the Rust ecosystem convention. It
+is compatible with every dependency (all permissive, see
+dependencies.md), and Apache-2.0 adds an explicit patent grant.
+`LICENSE-MIT` and `LICENSE-APACHE` are in the repository root. "Flint"
+stays a working name until the owner picks the final name (several
+unrelated projects already use it).
+
+## ADR-014 Background indexing must not compete with the user — Accepted
+
+Indexing runs in the background and must not be noticeable on an 8 GB
+machine. A shared `Governor` (`flint-index::governor`) applies these rules:
+
+* **Background priority.** Worker threads enter
+  `THREAD_MODE_BACKGROUND_BEGIN`: lowest CPU priority, very-low I/O
+  priority, low memory priority. On Windows 11 they also opt into EcoQoS,
+  which runs them on efficiency cores at lower clock. The search and UI
+  threads stay at normal priority. Setting:
+  `indexing.background_priority`.
+* **One heavy scan at a time.** Full enumerations and traversals queue for
+  a permit (setting `indexing.concurrent_scans`, default 1). Several disks
+  are never thrashed at once, and peak memory is that of one scan. Queued
+  volumes say "queued" in the status line, never "indexing".
+* **Yield to typing.** Each keystroke marks the user active for 500 ms.
+  Workers pause between 4096-record batches while the user is active. A
+  pause lasts at most 250 ms, so indexing always progresses. Setting:
+  `indexing.pause_while_typing`.
+* **Short lock holds.** Records are applied to the shared table 4096 at a
+  time, not in 50k batches, so a search waits milliseconds for the lock
+  during a scan.
+* **Memory returned.** After each bulk load or scan the table is shrunk if
+  more than 1/8 of it is slack.
+
+The governor only paces work and never drops any, so index correctness
+does not depend on it. It is tested for:
+
+* serialized scans, with queued status
+* a queued scan that can still be stopped
+* bounded pauses
+* the setup hook running on every worker
+
+It is not yet measured on hardware. The idle-CPU target also needs the
+open `BytesToWaitFor` item: the journal is still polled every second, a
+cheap read with no disk writes.
+
+## ADR-015 File operations: plan, review, revalidate, verify — Accepted
+
+The index can be stale, so no operation trusts it. `flint-ops` (tested on
+any OS with a fault-injecting fake filesystem) runs every operation in four
+steps.
+
+1. **Plan** against the live filesystem. Items are refused, with a reason,
+   when they are:
+   * missing, replaced (file ID differs), changed between file and folder,
+     or modified (traversal volumes)
+   * a drive or share root
+   * inside another selected folder (the outer folder covers them)
+   * a duplicate in the selection
+   * a move or copy into themselves, or a move into their current folder
+   * renamed to an invalid name: separators, `..`, reserved device names,
+     trailing dots or spaces, forbidden characters
+   * a rename or new folder whose name is already taken
+
+   The plan also notes links (the link is acted on, not its target), other
+   hard-link names, and destination collisions.
+2. **Review.** The user sees a preview (capped at 15 lines plus "and N
+   more") for batches, permanent deletes, and anything with warnings or
+   collisions. Permanent delete defaults to "No" and cannot run without
+   explicit confirmation. Delete goes to the Recycle Bin by default.
+3. **Revalidate** immediately before acting, against both the index
+   identity and what the preview showed. Items that changed are skipped,
+   never acted on.
+4. **Execute and verify.** One `IFileOperation` per batch provides the
+   progress UI, undo, elevation prompts and conflict dialogs. Collision
+   handling is configurable: ask, keep both, or skip. Each item's outcome
+   is then *observed*, not taken from the executor. Under Wine, which lacks
+   `IFileOperation`, the same plan runs through `SHFileOperationW`.
+
+Identity:
+
+* **Journal (NTFS) volumes:** the stored FRN is compared with the live file
+  ID. NTFS sequence numbers make a same-named replacement detectable.
+* **Traversal volumes:** synthetic IDs, so the check is type + size +
+  mtime. This is weaker, and documented as such.
+
+A window of milliseconds remains between the final check and the shell
+acting on the path; the shell's own checks apply within it.
+
+**Context menu.** Our items come first, then the native shell menu
+(`IContextMenu`, with `IContextMenu2/3` message forwarding, so third-party
+extensions keep working).
+
+* The native "delete" and "rename" verbs are intercepted and routed
+  through the pipeline above.
+* The native menu is offered only when every selected entry still matches
+  the index.
+* For items in different folders, only our menu is shown.
+
+Opening a file happens only on an explicit request (Enter, double-click,
+"Open"), after revalidation.
+
 ## Open decisions needing the owner
 
-1. **Elevation/service scope** (ADR-005).
-2. **Reference PC** specification for the performance targets.
-3. **Project name and license.** The workspace currently declares
-   `MIT OR Apache-2.0` as a placeholder; "Flint" is a working name.
-4. **Idle memory target vs index size.** The table uses ~75 bytes per entry,
-   so 1M entries ≈ 74 MB RSS against the 50 MB provisional target. Options:
-   * accept a per-entry budget (≈50 MB at ~650k entries)
-   * compact columns (folded-offset elision, 32-bit times), est. −10 B/entry
-   * drop derived caches when hidden (implemented: `trim_caches`)
-5. **Code signing** certificate and update channel (needed for signed
-   releases and update integrity).
+1. **Elevation/service scope** (ADR-005). Without elevation, NTFS volumes
+   are indexed by traversal plus change notifications, which is slower to
+   build and re-walked at each start.
+2. **Final project name.** "Flint" is a working name. The license is
+   decided (ADR-013).
+3. **Code signing** certificate and update channel, needed for signed
+   releases and update integrity. Free options for open-source projects
+   exist (e.g. SignPath Foundation), as does Azure Trusted Signing.
+
+Resolved: reference PC and memory budget (ADR-013), license (ADR-013).

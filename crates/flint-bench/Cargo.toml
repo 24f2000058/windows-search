@@ -2,6 +2,7 @@
 name = "flint-bench"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 flint-fuzzy = { version = "0.1.0", path = "../flint-fuzzy" }

@@ -13,18 +13,24 @@
 //! Indexing runs in a [`Catalog`] (one worker per volume); settings come from
 //! the versioned config in the data directory (installed or portable).
 //!
+//! File actions (open, reveal, clipboard, rename, move/copy, delete, compare,
+//! duplicates, native context menu) are in [`crate::actions`]; every
+//! destructive one is planned, reviewed and revalidated by `flint-ops`.
+//!
 //! Known limitations (tracked in docs/requirements.md): no settings window
-//! (edit config.toml), comctl32 v6 manifest not embedded, Enter only reveals
-//! in Explorer, file-type icons only.
+//! (edit config.toml), comctl32 v6 manifest not embedded, file-type icons
+//! only.
 
 use crate::icons::Icons;
+use crate::actions::Act;
 use crate::model::{search_options, status_line, Coverage, LatencyStats, Palette, ResultsModel};
+use crate::ux::{deeper_action, deeper_options, format_size, format_time, match_label, FilterChoice};
 use flint_config::Theme;
 use flint_index::catalog::{Catalog, CatalogOptions};
 use flint_commands::{websearch, Action, Registry};
 use flint_fuzzy::engine::{highlight, Options};
 use flint_fuzzy::table::flags;
-use flint_fuzzy::query::parse;
+use flint_fuzzy::query::{parse_with, Clock, UtcOffset};
 use flint_fuzzy::session::{Event, Session};
 use flint_fuzzy::table::{Meta, NameTable, NO_PARENT};
 use std::cell::{Cell, RefCell};
@@ -45,8 +51,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_APP_EVENT: u32 = WM_APP + 1;
 const WM_APP_INDEX: u32 = WM_APP + 2;
+/// A background task finished; lParam is a `Box<String>` to show.
+const WM_APP_NOTICE: u32 = WM_APP + 3;
 const ID_EDIT: isize = 100;
 const ID_LIST: isize = 101;
+/// Filter-bar dropdowns: ID_FILTER + index.
+const ID_FILTER: isize = 110;
+const COLUMNS: [(&str, i32); 5] = [("Name", 240), ("Folder", 0), ("Size", 76), ("Modified", 124), ("Match", 100)];
+const WIDTH: i32 = 860;
+const FILTER_W: i32 = 118;
 const HOTKEY_ID: i32 = 1;
 const SELFTEST_TIMER: usize = 7;
 /// Coalesce index-change repaints.
@@ -66,21 +79,23 @@ fn qpc() -> i64 {
 /// (SetWindowText -> EN_CHANGE, UpdateWindow -> WM_PAINT, LVM_* ->
 /// LVN_GETDISPINFO/custom draw), so mutable fields are individually wrapped
 /// and no borrow is ever held across a call that can dispatch messages.
-struct State {
-    hwnd: HWND,
+pub(crate) struct State {
+    pub(crate) hwnd: HWND,
     edit: HWND,
-    list: HWND,
-    table: Arc<RwLock<NameTable>>,
+    pub(crate) list: HWND,
+    combos: Vec<HWND>,
+    filters: RefCell<Vec<FilterChoice>>,
+    pub(crate) table: Arc<RwLock<NameTable>>,
     session: Session,
     latest: Arc<AtomicU64>,
     coverage: Arc<Mutex<Coverage>>,
     commands: Registry,
     freq: f64,
-    model: RefCell<ResultsModel>,
+    pub(crate) model: RefCell<ResultsModel>,
     query_text: RefCell<String>,
     command_line: RefCell<String>,
-    fonts: Cell<(HFONT, HFONT)>,
-    dpi: Cell<u32>,
+    pub(crate) fonts: Cell<(HFONT, HFONT)>,
+    pub(crate) dpi: Cell<u32>,
     t_hotkey: Cell<Option<i64>>,
     t_key: Cell<Option<(u64, i64)>>,
     hotkey_stats: RefCell<LatencyStats>,
@@ -90,10 +105,21 @@ struct State {
     selftest: Vec<String>,
     selftest_pos: Cell<usize>,
     /// None in `--synthetic` mode.
-    catalog: Option<Arc<Catalog>>,
+    pub(crate) catalog: Option<Arc<Catalog>>,
     indexing: flint_config::Indexing,
     only_root: Option<String>,
-    opts: Options,
+    /// Search options from the settings.
+    base_opts: Options,
+    /// Current options: `base_opts`, or deeper after F3 (reset on edit).
+    opts: RefCell<Options>,
+    tz: Arc<UtcOffset>,
+    pub(crate) files: flint_config::Files,
+    /// Open dialogs/menus; while > 0, losing activation does not hide.
+    modal: Cell<u32>,
+    /// Re-run the query when the index next changes (after a file action).
+    refresh_pending: Cell<bool>,
+    /// Range-selection anchor (Shift+Up/Down).
+    anchor: Cell<Option<usize>>,
     theme: Theme,
     palette: Cell<Palette>,
     /// (window background, edit background)
@@ -101,6 +127,66 @@ struct State {
     icons: RefCell<Icons>,
     /// Config/indexing messages shown until the user types.
     notice: RefCell<String>,
+}
+
+/// Marks a dialog/menu as open for its lifetime (see `State::modal`).
+pub(crate) struct Modal<'a>(&'a State);
+
+impl<'a> Modal<'a> {
+    pub(crate) fn new(s: &'a State) -> Self {
+        s.modal.set(s.modal.get() + 1);
+        Modal(s)
+    }
+}
+
+impl Drop for Modal<'_> {
+    fn drop(&mut self) {
+        self.0.modal.set(self.0.modal.get() - 1);
+    }
+}
+
+impl State {
+    /// Shows a message in the status strip until the next keystroke.
+    pub(crate) fn say(&self, text: &str) {
+        println!("action: {text}");
+        *self.command_line.borrow_mut() = text.to_owned();
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+
+    /// The action handed the user to another window (opened a file,
+    /// Explorer, properties).
+    pub(crate) fn leave(&self) {
+        hide(self);
+    }
+
+    /// After a file action: nudge indexing and re-run the query once the
+    /// index reflects the change (journal volumes see it within a poll).
+    pub(crate) fn refresh_after_change(&self) {
+        self.refresh_pending.set(true);
+        if let Some(c) = &self.catalog {
+            for k in c.keys() {
+                c.wake(&k);
+            }
+        }
+    }
+
+    /// Runs `f` off the UI thread and shows its result as a notice.
+    pub(crate) fn background(&self, f: impl FnOnce() -> String + Send + 'static) {
+        let hwnd = self.hwnd as usize;
+        std::thread::spawn(move || {
+            let p = Box::into_raw(Box::new(f()));
+            unsafe {
+                if PostMessageW(hwnd as HWND, WM_APP_NOTICE, 0, p as LPARAM) == 0 {
+                    drop(Box::from_raw(p));
+                }
+            }
+        });
+    }
+
+    fn clock(&self) -> Clock<'_> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        Clock { now, offset: &*self.tz }
+    }
 }
 
 fn coverage(s: &State) -> Coverage {
@@ -164,20 +250,75 @@ fn make_fonts(dpi: u32) -> (HFONT, HFONT) {
 
 fn layout(s: &State) {
     let d = s.dpi.get();
-    let (w, pad, eh, lh) = (scale(720, d), scale(8, d), scale(32, d), scale(420, d));
+    let (w, pad, eh, lh) = (scale(WIDTH, d), scale(8, d), scale(32, d), scale(420, d));
+    let fw = scale(FILTER_W, d);
+    let n = s.combos.len() as i32;
+    let edit_w = w - 2 * pad - n * (fw + pad);
     unsafe {
-        SetWindowPos(s.edit, null_mut(), pad, pad, w - 2 * pad, eh, SWP_NOZORDER);
+        SetWindowPos(s.edit, null_mut(), pad, pad, edit_w, eh, SWP_NOZORDER);
+        for (i, c) in s.combos.iter().enumerate() {
+            SetWindowPos(*c, null_mut(), pad + edit_w + pad + i as i32 * (fw + pad), pad + scale(2, d), fw, scale(300, d), SWP_NOZORDER);
+        }
         SetWindowPos(s.list, null_mut(), pad, pad * 2 + eh, w - 2 * pad, lh, SWP_NOZORDER);
-        SendMessageW(s.list, LVM_SETCOLUMNWIDTH, 0, scale(260, d) as LPARAM);
-        SendMessageW(s.list, LVM_SETCOLUMNWIDTH, 1, (w - 2 * pad - scale(280, d)) as LPARAM);
-        for h in [s.edit, s.list] {
+        let fixed: i32 = COLUMNS.iter().map(|c| c.1).sum();
+        for (i, (_, cw)) in COLUMNS.iter().enumerate() {
+            // The folder column takes the remaining width.
+            let width = if *cw == 0 { w - 2 * pad - scale(fixed + 24, d) } else { scale(*cw, d) };
+            SendMessageW(s.list, LVM_SETCOLUMNWIDTH, i, width as LPARAM);
+        }
+        for h in [s.edit, s.list].into_iter().chain(s.combos.iter().copied()) {
             SendMessageW(h, WM_SETFONT, s.fonts.get().0 as WPARAM, 1);
         }
     }
 }
 
 fn window_size(dpi: u32) -> (i32, i32) {
-    (scale(720, dpi), scale(8 * 3 + 32 + 420 + 26, dpi))
+    (scale(WIDTH, dpi), scale(8 * 3 + 32 + 420 + 26, dpi))
+}
+
+/// (Re)fills the filter dropdowns; "older than a year" depends on today.
+fn fill_filters(s: &State) {
+    let bar = crate::ux::filter_bar(&s.clock());
+    for (c, choice) in s.combos.iter().zip(&bar) {
+        unsafe {
+            SendMessageW(*c, CB_RESETCONTENT, 0, 0);
+            for (label, _) in &choice.options {
+                let w = wide(label);
+                SendMessageW(*c, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
+            }
+        }
+    }
+    *s.filters.borrow_mut() = bar;
+    sync_filters(s);
+}
+
+/// Shows the query's current filter terms in the dropdowns (blank when a
+/// typed value has no dropdown entry).
+fn sync_filters(s: &State) {
+    let text = s.query_text.borrow().clone();
+    let bar = s.filters.borrow();
+    for (c, choice) in s.combos.iter().zip(bar.iter()) {
+        let sel = crate::ux::current_choice(&text, choice).map_or(-1, |i| i as isize);
+        unsafe { SendMessageW(*c, CB_SETCURSEL, sel as WPARAM, 0) };
+    }
+}
+
+/// A dropdown changed: rewrite that filter term in the query text.
+fn on_filter_picked(s: &State, index: usize) {
+    let sel = unsafe { SendMessageW(s.combos[index], CB_GETCURSEL, 0, 0) };
+    let text = {
+        let bar = s.filters.borrow();
+        let (Some(choice), true) = (bar.get(index), sel >= 0) else { return };
+        let value = choice.options.get(sel as usize).map(|o| o.1.clone()).unwrap_or_default();
+        crate::ux::set_filter(&s.query_text.borrow(), choice, &value)
+    };
+    let w = wide(&text);
+    unsafe {
+        // Re-enters through EN_CHANGE, which submits the query.
+        SetWindowTextW(s.edit, w.as_ptr());
+        SetFocus(s.edit);
+        SendMessageW(s.edit, EM_SETSEL, w.len() - 1, (w.len() - 1) as LPARAM);
+    }
 }
 
 /// Shows the window centered on the monitor under the cursor.
@@ -194,6 +335,7 @@ fn show(s: &State) {
         let x = wa.left + ((wa.right - wa.left) - w) / 2;
         let y = wa.top + ((wa.bottom - wa.top) - h) / 4;
         SetWindowPos(s.hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+        fill_filters(s);
         SetForegroundWindow(s.hwnd);
         SetFocus(s.edit);
         SendMessageW(s.edit, EM_SETSEL, 0, -1);
@@ -212,28 +354,58 @@ fn hide(s: &State) {
     // Release derived search caches while idle; history is never stored.
     s.table.read().unwrap().trim_caches();
     s.session.clear_cache();
+    if let Some((private, ws)) = crate::resources::memory_usage() {
+        println!("hidden: private bytes {:.1} MB, working set {:.1} MB", private as f64 / 1e6, ws as f64 / 1e6);
+    }
 }
 
 fn submit(s: &State) {
     let mut buf = vec![0u16; 1024];
     let n = unsafe { GetWindowTextW(s.edit, buf.as_mut_ptr(), buf.len() as i32) } as usize;
     let text = String::from_utf16_lossy(&buf[..n]);
+    // A new query starts from the configured options again.
+    *s.opts.borrow_mut() = s.base_opts.clone();
+    run_query(s, text);
+    sync_filters(s);
+}
+
+/// F3: re-runs the current query one step deeper (weaker matches, then all
+/// remaining indexed candidates).
+fn search_deeper(s: &State) {
+    let d = {
+        let m = s.model.borrow();
+        m.status.as_ref().and_then(|st| deeper_action(st, &s.opts.borrow()))
+    };
+    match d {
+        Some(d) => {
+            *s.opts.borrow_mut() = deeper_options(&s.base_opts, d);
+            let text = s.query_text.borrow().clone();
+            run_query(s, text);
+        }
+        None => s.say("nothing deeper to search: every indexed candidate was already examined"),
+    }
+}
+
+fn run_query(s: &State, text: String) {
     let cmds = s.commands.evaluate(&text);
     *s.command_line.borrow_mut() = cmds.first().map(|c| format!("{}  —  {}", c.title, c.subtitle)).unwrap_or_default();
     s.notice.borrow_mut().clear();
     *s.query_text.borrow_mut() = text.clone();
+    if let (Some(c), true) = (&s.catalog, s.indexing.pause_while_typing) {
+        c.governor().note_user_activity();
+    }
     if cmds.first().is_some_and(|c| c.exclusive) {
         // `/s` claims the input; no file search runs for it.
         *s.model.borrow_mut() = ResultsModel::default();
         // Advance the generation so an in-flight file search is canceled and
         // its late results are rejected as stale.
-        let g = s.session.submit("", s.opts.clone());
+        let g = s.session.submit("", s.opts.borrow().clone());
         s.latest.store(g, Ordering::SeqCst);
         set_count(s);
         unsafe { InvalidateRect(s.hwnd, null(), 1) };
         return;
     }
-    let generation = s.session.submit(&text, s.opts.clone());
+    let generation = s.session.submit(&text, s.opts.borrow().clone());
     s.latest.store(generation, Ordering::SeqCst);
     s.t_key.set(Some((generation, qpc())));
 }
@@ -247,12 +419,47 @@ fn set_count(s: &State) {
         SendMessageW(s.list, LVM_SETITEMCOUNT, len, (LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL) as LPARAM);
         InvalidateRect(s.list, null(), 0);
         if let Some(i) = selected {
-            let mut item: LVITEMW = std::mem::zeroed();
-            item.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-            item.state = LVIS_SELECTED | LVIS_FOCUSED;
-            SendMessageW(s.list, LVM_SETITEMSTATE, i, &item as *const _ as LPARAM);
-            SendMessageW(s.list, LVM_ENSUREVISIBLE, i, 0);
+            s.anchor.set(Some(i));
+            select_rows(s, i, i);
         }
+    }
+}
+
+/// Selects rows `a..=b` (either order) only, focusing `focus`.
+fn select_rows(s: &State, a: usize, focus: usize) {
+    let (lo, hi) = (a.min(focus), a.max(focus));
+    unsafe {
+        let mut item: LVITEMW = std::mem::zeroed();
+        item.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+        // Clear only rows that are selected now (cheap for long lists).
+        let mut i: isize = -1;
+        loop {
+            i = SendMessageW(s.list, LVM_GETNEXTITEM, i as WPARAM, LVNI_SELECTED as LPARAM);
+            if i < 0 {
+                break;
+            }
+            if !(lo..=hi).contains(&(i as usize)) {
+                SendMessageW(s.list, LVM_SETITEMSTATE, i as usize, &item as *const _ as LPARAM);
+            }
+        }
+        for i in lo..=hi {
+            item.state = LVIS_SELECTED | if i == focus { LVIS_FOCUSED } else { 0 };
+            SendMessageW(s.list, LVM_SETITEMSTATE, i, &item as *const _ as LPARAM);
+        }
+        SendMessageW(s.list, LVM_ENSUREVISIBLE, focus, 0);
+    }
+}
+
+/// Text of one result cell (also what screen readers get).
+fn cell_text(s: &State, t: &NameTable, hit: &flint_fuzzy::engine::Hit, col: i32) -> String {
+    let m = t.meta(hit.id);
+    let is_dir = m.flags & flags::DIR != 0;
+    match col {
+        0 => t.name(hit.id).to_owned(),
+        1 => t.parent_path(hit.id),
+        2 => format_size(m.size, is_dir, m.flags & flags::META_STALE != 0),
+        3 => format_time(m.mtime, &s.clock()),
+        _ => match_label(hit.tier).to_owned(),
     }
 }
 
@@ -295,17 +502,9 @@ fn activate_selected(s: &State) {
         }
         return;
     }
-    let Some(id) = s.model.borrow().selected_id() else { return };
-    let path = s.table.read().unwrap().path(id);
-    // Revalidate: the index may be stale. Never execute; only reveal.
-    if !std::path::Path::new(&path).exists() {
-        *s.command_line.borrow_mut() = format!("no longer exists: {path}");
-        unsafe { InvalidateRect(s.hwnd, null(), 1) };
-        return;
-    }
-    let (op, exe, args) = (wide("open"), wide("explorer.exe"), wide(&format!("/select,\"{path}\"")));
-    unsafe { ShellExecuteW(null_mut(), op.as_ptr(), exe.as_ptr(), args.as_ptr(), null(), SW_SHOWNORMAL) };
-    hide(s);
+    // Opening runs only on this explicit request, after revalidation
+    // against the index identity (see actions::run).
+    crate::actions::run(s, Act::Open);
 }
 
 /// Draws `text` with the chars at `hl` (char indices) in bold accent color.
@@ -361,13 +560,36 @@ unsafe fn on_custom_draw(s: &State, cd: &mut NMLVCUSTOMDRAW) -> LRESULT {
             let bg = CreateSolidBrush(if selected { p.sel_bg } else { p.bg });
             FillRect(cd.nmcd.hdc, &rc, bg);
             DeleteObject(bg);
+            if cd.iSubItem >= 2 {
+                let text = {
+                    let t = s.table.read().unwrap();
+                    if !t.is_live(hit.id) {
+                        return CDRF_SKIPDEFAULT as LRESULT;
+                    }
+                    cell_text(s, &t, &hit, cd.iSubItem)
+                };
+                let w: Vec<u16> = text.encode_utf16().collect();
+                if w.is_empty() {
+                    // Never hand DrawTextW an empty buffer's dangling pointer.
+                    return CDRF_SKIPDEFAULT as LRESULT;
+                }
+                SelectObject(cd.nmcd.hdc, s.fonts.get().0);
+                SetBkMode(cd.nmcd.hdc, TRANSPARENT as i32);
+                // Match labels are dim: they describe, they do not rank.
+                SetTextColor(cd.nmcd.hdc, if selected { p.sel_text } else if cd.iSubItem == 4 { p.dim } else { p.text });
+                rc.left += scale(4, s.dpi.get());
+                rc.right -= scale(6, s.dpi.get());
+                let align = if cd.iSubItem == 2 { DT_RIGHT } else { DT_LEFT };
+                DrawTextW(cd.nmcd.hdc, w.as_ptr(), w.len() as i32, &mut rc, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+                return CDRF_SKIPDEFAULT as LRESULT;
+            }
             let (text, hl, is_dir) = {
                 let t = s.table.read().unwrap();
                 if !t.is_live(hit.id) {
                     return CDRF_SKIPDEFAULT as LRESULT;
                 }
-                let q = parse(&s.query_text.borrow(), 0);
-                let h = highlight(&t, &q, s.opts.intensity, &hit);
+                let q = parse_with(&s.query_text.borrow(), &s.clock());
+                let h = highlight(&t, &q, s.opts.borrow().intensity, &hit);
                 let is_dir = t.flags(hit.id) & flags::DIR != 0;
                 if cd.iSubItem == 0 { (t.name(hit.id).to_owned(), h.name, is_dir) } else { (t.parent_path(hit.id), h.dir, is_dir) }
             };
@@ -387,34 +609,106 @@ unsafe fn on_custom_draw(s: &State, cd: &mut NMLVCUSTOMDRAW) -> LRESULT {
     }
 }
 
-unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
-    if msg == WM_KEYDOWN {
-        let vk = wp as u16;
-        let delta = match vk {
-            VK_DOWN => Some(1),
-            VK_UP => Some(-1),
-            VK_NEXT => Some(10),
-            VK_PRIOR => Some(-10),
-            _ => None,
+fn key_down(vk: u16) -> bool {
+    unsafe { GetKeyState(vk as i32) < 0 }
+}
+
+/// Keyboard shortcuts in the search box (focus normally stays there).
+/// Returns true if the key was handled.
+fn on_key(s: &State, vk: u16, alt: bool) -> bool {
+    let (ctrl, shift) = (key_down(VK_CONTROL), key_down(VK_SHIFT));
+    if alt {
+        let act = match vk {
+            VK_RETURN => Act::Properties,
+            0x43 => Act::CopyFiles, // C
+            0x58 => Act::CutFiles,  // X
+            0x56 => Act::Paste,     // V
+            _ => return false,
         };
+        crate::actions::run(s, act);
+        return true;
+    }
+    let delta = match vk {
+        VK_DOWN => Some(1),
+        VK_UP => Some(-1),
+        VK_NEXT => Some(10),
+        VK_PRIOR => Some(-10),
+        _ => None,
+    };
+    if let Some(d) = delta {
+        s.model.borrow_mut().move_selection(d);
+        let focus = s.model.borrow().selected;
+        if let Some(f) = focus {
+            let anchor = if shift { s.anchor.get().unwrap_or(f) } else { f };
+            s.anchor.set(Some(anchor));
+            select_rows(s, anchor, f);
+        }
+        return true;
+    }
+    match vk {
+        VK_RETURN if ctrl => crate::actions::run(s, Act::Reveal),
+        VK_RETURN if shift => crate::actions::run(s, Act::OpenWith),
+        VK_RETURN => activate_selected(s),
+        VK_ESCAPE => hide(s),
+        VK_F3 => search_deeper(s),
+        VK_F2 => crate::actions::run(s, Act::Rename),
+        VK_DELETE if ctrl && shift => crate::actions::run(s, Act::DeletePermanently),
+        VK_DELETE if ctrl => crate::actions::run(s, Act::Recycle),
+        0x43 if ctrl && shift => crate::actions::run(s, Act::CopyPath), // C
+        0x4E if ctrl && shift => crate::actions::run(s, Act::NewFolder), // N
+        VK_APPS => crate::actions::context_menu(s, crate::actions::menu_point_for_keyboard(s), shift),
+        VK_F10 if shift => crate::actions::context_menu(s, crate::actions::menu_point_for_keyboard(s), false),
+        VK_TAB => unsafe {
+            // Tab moves to the filter bar (Shift+Tab to its last dropdown).
+            SetFocus(if shift { *s.combos.last().unwrap() } else { s.combos[0] });
+        },
+        _ => return false,
+    }
+    true
+}
+
+unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
         if let Some(s) = state() {
-            if let Some(d) = delta {
-                s.model.borrow_mut().move_selection(d);
-                set_count(&s);
-                return 0;
-            }
-            if vk == VK_RETURN {
-                activate_selected(&s);
-                return 0;
-            }
-            if vk == VK_ESCAPE {
-                hide(&s);
+            if on_key(&s, wp as u16, msg == WM_SYSKEYDOWN) {
                 return 0;
             }
         }
     }
-    if msg == WM_CHAR && (wp == 13 || wp == 27) {
-        return 0; // swallow the beep for Enter/Esc
+    // Swallow the beep for handled Enter/Esc/Tab and Alt shortcuts.
+    if msg == WM_CHAR && (wp == 13 || wp == 27 || wp == 9) {
+        return 0;
+    }
+    if msg == WM_SYSCHAR && matches!(wp as u8, b'c' | b'x' | b'v' | b'C' | b'X' | b'V' | 13) {
+        return 0;
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+
+/// Filter dropdowns: Tab/Shift+Tab move along the bar and back to the
+/// search box; Esc (when closed) returns to the search box.
+unsafe extern "system" fn combo_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, id: usize, _data: usize) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        if let Some(s) = state() {
+            let i = id - ID_FILTER as usize;
+            let vk = wp as u16;
+            let dropped = SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0;
+            if vk == VK_TAB {
+                let next = if key_down(VK_SHIFT) { i.checked_sub(1) } else { Some(i + 1).filter(|&n| n < s.combos.len()) };
+                SetFocus(next.map_or(s.edit, |n| s.combos[n]));
+                return 0;
+            }
+            if vk == VK_ESCAPE && !dropped {
+                SetFocus(s.edit);
+                return 0;
+            }
+        }
+    }
+    if msg == WM_GETDLGCODE {
+        return DLGC_WANTALLKEYS as LRESULT;
+    }
+    if msg == WM_CHAR && (wp == 9 || wp == 27) {
+        return 0;
     }
     DefSubclassProc(hwnd, msg, wp, lp)
 }
@@ -445,15 +739,27 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             0
         }
         WM_ACTIVATE => {
-            if (wp & 0xFFFF) as u32 == WA_INACTIVE && s.selftest.is_empty() {
+            // Dialogs and menus we opened take activation; that is not the
+            // user leaving.
+            if (wp & 0xFFFF) as u32 == WA_INACTIVE && s.selftest.is_empty() && s.modal.get() == 0 {
                 hide(s);
             }
             0
+        }
+        WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR => {
+            // Owner-drawn and lazily filled items of shell extensions.
+            match flint_ops::win::forward_menu_message(msg, wp, lp) {
+                Some(r) => r,
+                None => DefWindowProcW(hwnd, msg, wp, lp),
+            }
         }
         WM_COMMAND => {
             let (id, code) = ((wp & 0xFFFF) as isize, ((wp >> 16) & 0xFFFF) as u32);
             if id == ID_EDIT && code == EN_CHANGE {
                 submit(s);
+            }
+            if (ID_FILTER..ID_FILTER + s.combos.len() as isize).contains(&id) && code == CBN_SELCHANGE {
+                on_filter_picked(s, (id - ID_FILTER) as usize);
             }
             0
         }
@@ -470,7 +776,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                         let hit = s.model.borrow().hits.get(row).copied();
                         let text = hit.map(|h| {
                             let t = s.table.read().unwrap();
-                            if di.item.iSubItem == 0 { t.name(h.id).to_owned() } else { t.parent_path(h.id) }
+                            if t.is_live(h.id) { cell_text(s, &t, &h, di.item.iSubItem) } else { String::new() }
                         });
                         let mut buf = s.disp_buf.borrow_mut();
                         *buf = wide(&text.unwrap_or_default());
@@ -487,11 +793,17 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                     activate_selected(s);
                     0
                 }
+                NM_RCLICK => {
+                    let mut pt = POINT { x: 0, y: 0 };
+                    GetCursorPos(&mut pt);
+                    crate::actions::context_menu(s, pt, key_down(VK_SHIFT));
+                    0
+                }
                 LVN_ITEMCHANGED => {
                     let nm = &*(lp as *const NMLISTVIEW);
                     // Our own programmatic selection arrives while the model
                     // may be borrowed; that change is already reflected.
-                    if nm.uNewState & LVIS_SELECTED != 0 && nm.iItem >= 0 {
+                    if nm.uNewState & LVIS_FOCUSED != 0 && nm.iItem >= 0 {
                         if let Ok(mut m) = s.model.try_borrow_mut() {
                             m.selected = Some(nm.iItem as usize);
                         }
@@ -511,7 +823,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             let cov = coverage(s);
             let mut line = {
                 let m = s.model.borrow();
-                m.status.as_ref().map(|st| status_line(st, m.hits.len(), &cov)).unwrap_or_else(|| status_line_idle(&cov))
+                m.status.as_ref().map(|st| status_line(st, m.hits.len(), &cov, deeper_action(st, &s.opts.borrow()))).unwrap_or_else(|| status_line_idle(&cov))
             };
             let cmd = s.command_line.borrow().clone();
             if !cmd.is_empty() {
@@ -539,6 +851,15 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             on_event(s, ev);
             0
         }
+        WM_TIMER if wp == SELFTEST_TIMER && s.modal.get() > 0 => {
+            EndMenu();
+            let cls = wide("FlintPrompt");
+            let prompt = FindWindowW(cls.as_ptr(), null());
+            if !prompt.is_null() {
+                PostMessageW(prompt, WM_CLOSE, 0, 0);
+            }
+            0
+        }
         WM_TIMER if wp == SELFTEST_TIMER => {
             // Wait for indexing before typing, then one query per tick.
             let indexing = {
@@ -553,6 +874,16 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 s.selftest_pos.set(pos + 1);
                 // Type it character by character, as a user would; each
                 // SetWindowText synchronously re-enters via EN_CHANGE.
+                // {KEY} steps stand for shortcuts; a menu or dialog they open
+                // is dismissed on the next tick (timers still fire in its
+                // modal loop).
+                match s.selftest[pos].as_str() {
+                    "{F3}" => return { search_deeper(s); 0 },
+                    "{MENU}" => return { crate::actions::context_menu(s, crate::actions::menu_point_for_keyboard(s), false); 0 },
+                    "{RENAME}" => return { crate::actions::run(s, Act::Rename); 0 },
+                    "{COPYPATH}" => return { crate::actions::run(s, Act::CopyPath); 0 },
+                    _ => {}
+                }
                 let mut acc = String::new();
                 for c in s.selftest[pos].chars() {
                     acc.push(c);
@@ -571,8 +902,24 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             }
             0
         }
+        WM_APP_NOTICE => {
+            let text = *Box::from_raw(lp as *mut String);
+            s.say(text.lines().next().unwrap_or(""));
+            if text.contains('\n') && IsWindowVisible(s.hwnd) != 0 {
+                let _m = Modal::new(s);
+                let (t, c) = (wide(&text), wide("Flint"));
+                MessageBoxW(s.hwnd, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+            }
+            0
+        }
         WM_APP_INDEX => {
             INDEX_REPAINT_PENDING.store(false, Ordering::SeqCst);
+            if s.refresh_pending.replace(false) {
+                // Show the effect of a file action; the status keeps its message.
+                let (text, msg) = (s.query_text.borrow().clone(), s.command_line.borrow().clone());
+                run_query(s, text);
+                *s.command_line.borrow_mut() = msg;
+            }
             // Repaint only the status strip; results refresh on next query.
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(hwnd, &mut rc);
@@ -586,7 +933,7 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             FillRect(wp as HDC, &rc, s.brushes.get().0);
             1
         }
-        WM_CTLCOLOREDIT => {
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
             let p = s.palette.get();
             SetTextColor(wp as HDC, p.text);
             SetBkColor(wp as HDC, p.edit_bg);
@@ -624,6 +971,13 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 for v in c.statuses() {
                     println!("volume {}: {:?}, loaded via {:?}, stale meta {}, rescans {}", v.root_name, v.phase, v.load_source, v.stale_meta, v.stats.rescans);
                 }
+            }
+            if let Some(c) = &s.catalog {
+                let g = c.governor().stats();
+                println!("indexing paused for typing: {:.1} s total", g.paused.as_secs_f64());
+            }
+            if let Some((private, ws)) = crate::resources::memory_usage() {
+                println!("private bytes {:.1} MB, working set {:.1} MB, index entries {}", private as f64 / 1e6, ws as f64 / 1e6, s.table.read().unwrap().live_count());
             }
             for (label, st) in [("hotkey -> painted", &s.hotkey_stats), ("keystroke -> results painted", &s.key_stats)] {
                 if let Some((n, p50, p95, max)) = st.borrow().summary() {
@@ -692,6 +1046,10 @@ pub fn run() {
     let cfg = loaded.config;
     let mut notices: Vec<String> = loaded.notes.iter().filter(|n| !matches!(n, flint_config::Note::Created)).map(|n| format!("settings: {n:?}")).collect();
     println!("data dir: {} (portable: {}), config notes: {:?}", paths.data_dir.display(), paths.portable, loaded.notes);
+    // The shell (file operations, context menus, clipboard) needs OLE.
+    if let Err(e) = flint_ops::win::init_com() {
+        notices.push(format!("shell integration unavailable: {e}"));
+    }
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES };
@@ -715,14 +1073,23 @@ pub fn run() {
         };
         RegisterClassExW(&wc);
         let title = wide("Flint");
-        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, class.as_ptr(), title.as_ptr(), WS_POPUP | WS_BORDER, 0, 0, 720, 520, null_mut(), null_mut(), hinst, null());
+        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, class.as_ptr(), title.as_ptr(), WS_POPUP | WS_BORDER, 0, 0, WIDTH, 520, null_mut(), null_mut(), hinst, null());
         let dpi = GetDpiForWindow(hwnd).max(96);
         let edit_cls = wide("EDIT");
         let edit = CreateWindowExW(0, edit_cls.as_ptr(), null(), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32, 0, 0, 10, 10, hwnd, ID_EDIT as HMENU, hinst, null());
         let lv_cls = wide("SysListView32");
-        let list = CreateWindowExW(0, lv_cls.as_ptr(), null(), WS_CHILD | WS_VISIBLE | (LVS_REPORT | LVS_OWNERDATA | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER), 0, 0, 10, 10, hwnd, ID_LIST as HMENU, hinst, null());
+        let combo_cls = wide("COMBOBOX");
+        let mut combos = Vec::new();
+        for (i, label) in ["File type filter", "Size filter", "Date modified filter"].iter().enumerate() {
+            let name = wide(label);
+            let c = CreateWindowExW(0, combo_cls.as_ptr(), name.as_ptr(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 0, 0, 10, 10, hwnd, (ID_FILTER + i as isize) as HMENU, hinst, null());
+            SetWindowSubclass(c, Some(combo_proc), ID_FILTER as usize + i, 0);
+            combos.push(c);
+        }
+        // Multi-select: batch operations act on every selected row.
+        let list = CreateWindowExW(0, lv_cls.as_ptr(), null(), WS_CHILD | WS_VISIBLE | (LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER), 0, 0, 10, 10, hwnd, ID_LIST as HMENU, hinst, null());
         SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as LPARAM);
-        for (i, name) in ["Name", "Folder"].iter().enumerate() {
+        for (i, (name, _)) in COLUMNS.iter().enumerate() {
             let mut text = wide(name);
             let mut col: LVCOLUMNW = std::mem::zeroed();
             col.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -735,7 +1102,8 @@ pub fn run() {
         let table = Arc::new(RwLock::new(NameTable::new()));
         let latest = Arc::new(AtomicU64::new(0));
         let hwnd_bits = hwnd as usize;
-        let session = Session::new(table.clone(), Duration::from_millis(cfg.search.debounce_ms), move |ev: Event| {
+        let tz: Arc<UtcOffset> = Arc::new(crate::resources::local_offset);
+        let session = Session::with_time_zone(table.clone(), Duration::from_millis(cfg.search.debounce_ms), tz.clone(), move |ev: Event| {
             let p = Box::into_raw(Box::new(ev));
             if PostMessageW(hwnd_bits as HWND, WM_APP_EVENT, 0, p as LPARAM) == 0 {
                 drop(Box::from_raw(p));
@@ -754,8 +1122,10 @@ pub fn run() {
                     }
                 });
                 let meta = CatalogOptions { meta_batch: cfg.indexing.metadata_refresh_per_second as usize, ..CatalogOptions::default() };
+                let setup: Option<flint_index::governor::ThreadSetup> = cfg.indexing.background_priority.then(|| Arc::new(crate::resources::enter_background_mode) as _);
+                let gov = flint_index::governor::Governor::new(flint_index::governor::GovernorOptions { max_scans: cfg.indexing.concurrent_scans as usize, ..Default::default() }, setup);
                 match Catalog::new(table.clone(), paths.index_db.clone(), Some(paths.snapshots.clone()), meta, on_change) {
-                    Ok(c) => Some(Arc::new(c)),
+                    Ok(c) => Some(Arc::new(c.with_governor(gov))),
                     Err(e) => {
                         notices.push(format!("index database unavailable: {e}"));
                         None
@@ -770,6 +1140,8 @@ pub fn run() {
             hwnd,
             edit,
             list,
+            combos,
+            filters: RefCell::new(Vec::new()),
             table,
             session,
             latest,
@@ -791,7 +1163,13 @@ pub fn run() {
             catalog,
             indexing: cfg.indexing.clone(),
             only_root: root,
-            opts: search_options(&cfg.search),
+            base_opts: search_options(&cfg.search),
+            opts: RefCell::new(search_options(&cfg.search)),
+            tz,
+            files: cfg.files.clone(),
+            modal: Cell::new(0),
+            refresh_pending: Cell::new(false),
+            anchor: Cell::new(None),
             theme: cfg.general.theme,
             palette: Cell::new(crate::model::palette(false)),
             brushes: Cell::new((null_mut(), null_mut())),
@@ -799,6 +1177,7 @@ pub fn run() {
             notice: RefCell::new(String::new()),
         });
         layout(&state);
+        fill_filters(&state);
         apply_palette(&state);
         resync_volumes(&state);
         STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
