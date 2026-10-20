@@ -597,9 +597,11 @@ guide: [plugins.md](plugins.md).
 * **Tests:** 11 unit tests and 13 against a real plugin process, covering protocol
   round trip, withheld paths, crash/hang/garbage/oversize/wrong-id
   recovery, strikes, error answers, flooding, permission stripping, API
-  mismatch, changed files and latest-wins. The confined spawn ran under
-  Wine; Wine does not enforce integrity levels or the job's process
-  limit, so those need Windows hardware.
+  mismatch, changed files and latest-wins. The confined spawn runs in CI
+  on native Windows (GitHub's Windows Server 2022 runner), where the job's
+  one-process limit is verified to refuse a child process. Wine enforces
+  neither that limit nor integrity levels. The low-integrity token is
+  applied but not yet checked by a test.
 
 ## ADR-020 Updates: manual by default, signed manifest, verified download — Accepted
 

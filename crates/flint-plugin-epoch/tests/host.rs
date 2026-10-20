@@ -162,14 +162,17 @@ fn service_is_latest_wins_and_survives_a_broken_plugin() {
         svc.query("epoch", g, &g.to_string());
     }
     let t = Instant::now();
-    while !got.lock().unwrap().iter().any(|d| d.generation == 40) && t.elapsed() < Duration::from_secs(10) {
+    // Each plugin answers on its own worker thread: wait for both.
+    let done = |v: &[Delivery]| v.iter().any(|d| d.plugin == "epoch" && d.generation == 40) && v.iter().any(|d| d.plugin == "broken");
+    while !done(&got.lock().unwrap()) && t.elapsed() < Duration::from_secs(20) {
         std::thread::sleep(Duration::from_millis(10));
     }
     let v = got.lock().unwrap();
     let epoch: Vec<&Delivery> = v.iter().filter(|d| d.plugin == "epoch").collect();
     assert!(epoch.len() < 39, "superseded queries were skipped ({} answered)", epoch.len());
     assert!(matches!(&epoch.last().unwrap().outcome, Ok(Answer::Items(i)) if i[0].subtitle.contains("40 as Unix")));
-    assert!(v.iter().any(|d| d.plugin == "broken" && matches!(d.outcome, Err(PluginError::Crashed(_)))));
+    let broken: Vec<_> = v.iter().filter(|d| d.plugin == "broken").map(|d| &d.outcome).collect();
+    assert!(matches!(broken.as_slice(), [Err(PluginError::Crashed(_))]), "{broken:?}");
     drop(v);
     svc.stop_all();
 }

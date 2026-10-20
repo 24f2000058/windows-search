@@ -128,8 +128,8 @@ Remaining:
 - [ ] Run the CI and release workflows on GitHub (written and
   syntax-checked, not yet run).
 - [ ] Validate on Windows hardware:
-  * low-integrity plugin launch and the Job Object child-process and CPU
-    limits
+  * low-integrity plugin launch and the Job Object CPU cap (the
+    child-process limit is verified in native Windows CI)
   * WinHTTP against GitHub
   * MSI install/upgrade/uninstall
   * the `/diag` window

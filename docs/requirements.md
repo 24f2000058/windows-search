@@ -109,7 +109,7 @@ Legend:
 
 | Requirement | Status |
 |---|---|
-| Versioned API, isolated helpers, permissions, approval, timeouts, recovery, limits, core survives failure | **Tested** (11 unit tests and 13 tests against a real plugin process, plus a Windows-only confined-spawn test run under Wine); low integrity and the job's child-process limit not enforced by Wine, so unverified on hardware (ADR-019, [plugins.md](plugins.md)) |
+| Versioned API, isolated helpers, permissions, approval, timeouts, recovery, limits, core survives failure | **Tested** (11 unit tests and 13 tests against a real plugin process, plus a Windows-only confined-spawn test). The job's child-process limit is verified on native Windows in CI; the low-integrity token is not yet verified by a test (ADR-019, [plugins.md](plugins.md)) |
 
 ## 9. Privacy, security, resources
 
